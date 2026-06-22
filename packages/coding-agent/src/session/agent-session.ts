@@ -425,6 +425,13 @@ const RETRY_BACKOFF_JITTER_RATIO = 0.25;
  */
 const SHAKE_RECOVERY_BAND = 0.8;
 
+type SnapcompactBudgetSkipReason = "base-over-budget" | "frame-over-budget";
+
+type SnapcompactFrameBudget = Readonly<{
+	maxFrames: number;
+	skipReason?: SnapcompactBudgetSkipReason;
+}>;
+
 function calculateRetryBackoffDelayMs(baseDelayMs: number, attempt: number): number {
 	const cappedDelayMs = Math.min(Math.max(0, baseDelayMs) * 2 ** Math.max(0, attempt - 1), RETRY_BACKOFF_MAX_DELAY_MS);
 	const jitter = 1 - Math.random() * RETRY_BACKOFF_JITTER_RATIO;
@@ -7799,19 +7806,26 @@ export class AgentSession {
 			let details: unknown;
 
 			// Snapcompact runs locally first. The frame cap is sized from the live
-			// model window via #computeSnapcompactMaxFrames so the post-render context
-			// fits without the warning loop (issue #3247). Zero-frame budget → skip
-			// snapcompact and take the summarizer path immediately.
+			// model window via #computeSnapcompactFrameBudget so the post-render
+			// context fits without the warning loop (issue #3247). When the budget
+			// cannot fit either kept history or the archive frames snapcompact would
+			// need, skip it and take the summarizer path immediately.
 			let snapcompactResult: snapcompact.CompactionResult | undefined;
 			if (snapcompactReady) {
-				const maxFrames = this.#computeSnapcompactMaxFrames(preparation, effectiveSettings);
-				if (maxFrames < 1) {
-					logger.warn("Snapcompact skipped: kept history alone exceeds the context budget", {
-						model: this.model?.id,
-					});
+				const frameBudget = this.#computeSnapcompactFrameBudget(preparation, effectiveSettings, convertToLlm);
+				if (frameBudget.maxFrames < 1) {
+					const frameBounded = frameBudget.skipReason === "frame-over-budget";
+					logger.warn(
+						frameBounded
+							? "Snapcompact skipped: archive needs frames but no frame fits the context budget"
+							: "Snapcompact skipped: kept history alone exceeds the context budget",
+						{ model: this.model?.id },
+					);
 					this.emitNotice(
 						"warning",
-						"snapcompact: kept history alone exceeds the context budget — using an LLM summary instead",
+						frameBounded
+							? "snapcompact: archive needs image frames but the remaining context budget cannot fit one — using an LLM summary instead"
+							: "snapcompact: kept history alone exceeds the context budget — using an LLM summary instead",
 						"compaction",
 					);
 				} else {
@@ -7819,7 +7833,7 @@ export class AgentSession {
 						convertToLlm,
 						model: this.model,
 						shape: snapcompact.resolveShape(this.model, this.settings.get("snapcompact.shape")),
-						maxFrames,
+						maxFrames: frameBudget.maxFrames,
 					});
 					const ctxWindow = this.model?.contextWindow ?? 0;
 					const budget =
@@ -7875,6 +7889,7 @@ export class AgentSession {
 							promptOverride: this.#obfuscateTextForProvider(compactionPrep.hookPrompt),
 							extraContext: compactionPrep.hookContext,
 							remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+							migrateSnapcompactArchive: effectiveSettings.strategy === "snapcompact" ? true : undefined,
 							convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
 						},
 					);
@@ -9346,6 +9361,7 @@ export class AgentSession {
 						...options,
 						metadata: this.agent.metadataForProvider(candidate.provider),
 						convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
+						snapcompactShape: snapcompact.resolveShape(candidate, this.settings.get("snapcompact.shape")),
 						telemetry,
 						// Honor the user's /model thinking selection (incl. `off`) on
 						// the manual `/compact` path. Clamped per-model inside compact()
@@ -9454,9 +9470,13 @@ export class AgentSession {
 	 * ~402k frame-token projection always overflows any sub-1M-token window
 	 * (issue #3247).
 	 */
-	#computeSnapcompactMaxFrames(preparation: CompactionPreparation, settings: CompactionSettings): number {
+	#computeSnapcompactFrameBudget(
+		preparation: CompactionPreparation,
+		settings: CompactionSettings,
+		convertToLlm: (messages: AgentMessage[]) => Message[],
+	): SnapcompactFrameBudget {
 		const ctxWindow = this.model?.contextWindow ?? 0;
-		if (ctxWindow <= 0) return snapcompact.MAX_FRAMES_DEFAULT;
+		if (ctxWindow <= 0) return { maxFrames: snapcompact.MAX_FRAMES_DEFAULT };
 		const reserve = effectiveReserveTokens(ctxWindow, settings);
 		let baseTokens = computeNonMessageTokens(this);
 		for (const message of preparation.recentMessages) {
@@ -9466,36 +9486,34 @@ export class AgentSession {
 		// Skip iff there is no headroom whatsoever; a text-only archive costs
 		// far less than the cap reserve below, so any positive residual is
 		// worth attempting and the projection guard catches actual overflow.
-		if (baseTokens >= totalBudget) return 0;
+		if (baseTokens >= totalBudget) return { maxFrames: 0, skipReason: "base-over-budget" };
 		// Cap reserve mirrors what `estimateTokens(summaryMessage)` will charge
 		// when frames > 0: `countTokens(summaryTemplate ‖ textHead ‖ textTail)`
 		// plus `numFrames × FRAME_TOKEN_ESTIMATE`. Resolve the shape this
 		// snapcompact pass will actually use (matches the `shape` argument
 		// passed to `snapcompact.compact` in the auto and manual paths) so the
 		// text-edge cost reflects the live frame geometry rather than a fixed
-		// approximation. Reviewer (chatgpt-codex on #3249): a 4k reserve
-		// undersized the ~7k text-edge cost on the default Anthropic
-		// 11on16-bw shape, so the projection then rejected the `maxFrames`
-		// the cap had picked and the warning loop reappeared.
-		//
-		// - `textHead` and `textTail` each consume up to `geometry.capacity`
-		//   chars when frames > 0 (one HQ-capacity page per edge: see
-		//   `TEXT_EDGE_PAGES = 1` in `planArchive`), so 2 × capacity chars
-		//   total. Per-shape capacity: Anthropic 11on16-bw ~13.9k, Opus
-		//   1932px ~21k, Gemini 8on22-bw 2048px ~23.8k, OpenAI 1568px ~13.9k.
-		// - tiktoken cl100k ≈ 4 chars/token on ASCII (verified empirically
-		//   for prose, code, and JSON); a 1.15 multiplier absorbs tokenizer
-		//   drift on denser content (e.g. dense JSON / tool-result blobs).
-		// - Summary template (intro + FILES section + grid notes) bills
-		//   ~2k tokens for typical sessions.
+		// approximation.
 		const shape = snapcompact.resolveShape(this.model, this.settings.get("snapcompact.shape"));
 		const edgeCap = snapcompact.geometry(shape).capacity;
 		const textEdgeTokens = Math.ceil((2 * edgeCap * 1.15) / 4);
 		const SUMMARY_TEMPLATE_TOKENS = 2000;
 		const capReserve = textEdgeTokens + SUMMARY_TEMPLATE_TOKENS;
 		const frameBudget = totalBudget - baseTokens - capReserve;
-		if (frameBudget < snapcompact.FRAME_TOKEN_ESTIMATE) return 1;
-		return Math.min(Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE), snapcompact.MAX_FRAMES_DEFAULT);
+		if (frameBudget < snapcompact.FRAME_TOKEN_ESTIMATE) {
+			const archiveSize = snapcompact.estimateArchiveSize(preparation, {
+				convertToLlm,
+				model: this.model,
+				shape,
+			});
+			return archiveSize.textOnly ? { maxFrames: 1 } : { maxFrames: 0, skipReason: "frame-over-budget" };
+		}
+		return {
+			maxFrames: Math.min(
+				Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE),
+				snapcompact.MAX_FRAMES_DEFAULT,
+			),
+		};
 	}
 
 	/**
@@ -9768,14 +9786,20 @@ export class AgentSession {
 					);
 					action = "context-full";
 				} else {
-					const maxFrames = this.#computeSnapcompactMaxFrames(preparation, compactionSettings);
-					if (maxFrames < 1) {
-						logger.warn("Snapcompact skipped: kept history alone exceeds the context budget", {
-							model: this.model?.id,
-						});
+					const frameBudget = this.#computeSnapcompactFrameBudget(preparation, compactionSettings, convertToLlm);
+					if (frameBudget.maxFrames < 1) {
+						const frameBounded = frameBudget.skipReason === "frame-over-budget";
+						logger.warn(
+							frameBounded
+								? "Snapcompact skipped: archive needs frames but no frame fits the context budget"
+								: "Snapcompact skipped: kept history alone exceeds the context budget",
+							{ model: this.model?.id },
+						);
 						this.emitNotice(
 							"warning",
-							"snapcompact: kept history alone exceeds the context budget — using an LLM summary instead",
+							frameBounded
+								? "snapcompact: archive needs image frames but the remaining context budget cannot fit one — using an LLM summary instead"
+								: "snapcompact: kept history alone exceeds the context budget — using an LLM summary instead",
 							"compaction",
 						);
 						action = "context-full";
@@ -9784,7 +9808,7 @@ export class AgentSession {
 							convertToLlm,
 							model: this.model,
 							shape: snapcompact.resolveShape(this.model, this.settings.get("snapcompact.shape")),
-							maxFrames,
+							maxFrames: frameBudget.maxFrames,
 						});
 					}
 				}
@@ -9856,6 +9880,11 @@ export class AgentSession {
 									metadata: this.agent.metadataForProvider(candidate.provider),
 									initiatorOverride: "agent",
 									convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
+									migrateSnapcompactArchive: compactionSettings.strategy === "snapcompact" ? true : undefined,
+									snapcompactShape: snapcompact.resolveShape(
+										candidate,
+										this.settings.get("snapcompact.shape"),
+									),
 									telemetry,
 									// Honor the user's /model thinking selection on the
 									// auto-compaction path — the most-fired compaction

@@ -1457,36 +1457,17 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
 	};
 }
 
-/**
- * Run a snapcompact compaction over prepared messages. Fully local: serializes
- * the discarded history, appends it to the accumulated archive source text, and
- * re-renders that source into an ordered history layout: plain text at the
- * oldest edge, imaged middle, then plain text at the newest edge. The imaged
- * middle itself foveates (HQ/LQ/HQ) when it grows large.
- *
- * The full kept source persists on the archive (`text`) so each later compaction
- * unfolds and re-renders it coherently alongside the newly archived history.
- *
- * If the previous compaction was text-based, its summary is printed at the head
- * of the archive as `[Summary of earlier history]` so no continuity is lost.
- */
-export async function compact<TMessage = Message>(
+interface ArchiveTextInput {
+	archiveText: string;
+	previousArchive?: Archive;
+	includedPreviousSummary: boolean;
+}
+
+function buildArchiveText<TMessage = Message>(
 	preparation: CompactionPreparation<TMessage>,
 	options?: Options<TMessage>,
-): Promise<CompactionResult> {
-	const { firstKeptEntryId, tokensBefore, previousSummary, previousPreserveData, fileOps } = preparation;
-	if (!firstKeptEntryId) {
-		throw new Error("First kept entry has no ID - session may need migration");
-	}
-	const baseShape = options?.shape ?? resolveShape(options?.model);
-	const frameSize = options?.frameSize ?? baseShape.frameSize;
-	const high = frameSize === baseShape.frameSize ? baseShape : { ...baseShape, frameSize };
-	const low = denseCompanion(high, options?.model?.api);
-	const geo = geometry(high);
-	// The engine default caps archive growth; a caller-supplied maxFrames only
-	// lowers it further (an upper limit), never raising it past the default.
-	const maxFrames = Math.max(1, Math.min(options?.maxFrames ?? MAX_FRAMES_DEFAULT, MAX_FRAMES_DEFAULT));
-
+): ArchiveTextInput {
+	const { previousSummary, previousPreserveData } = preparation;
 	const messages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	let archiveText = normalize(serializeConversation(llmMessages, options));
@@ -1504,14 +1485,73 @@ export async function compact<TMessage = Message>(
 		archiveText = archiveText.length > 0 ? `${head} [Recent conversation] ${archiveText}` : head;
 	}
 
-	let truncatedChars = previousArchive?.truncatedChars ?? 0;
-
 	// Re-compacting a snapcompacted history unfolds the prior archive's source
 	// text and treats it as one coherent transcript: the previous kept source
 	// ages in ahead of the new history, then the whole thing is re-rendered.
 	if (hasPreviousText) {
 		archiveText = archiveText.length > 0 ? `${previousText}${NEWLINE_GLYPH}${archiveText}` : previousText;
 	}
+
+	return { archiveText, previousArchive, includedPreviousSummary };
+}
+
+export interface ArchiveSizeEstimate {
+	/** Normalized source chars that snapcompact would lay out, including prior preserved archive text. */
+	normalizedChars: number;
+	/** Verbatim text-edge capacity before any frame is required. */
+	textOnlyCapacity: number;
+	/** True when the archive can fit as text-only with zero image frames. */
+	textOnly: boolean;
+}
+
+export function estimateArchiveSize<TMessage = Message>(
+	preparation: CompactionPreparation<TMessage>,
+	options?: Options<TMessage>,
+): ArchiveSizeEstimate {
+	const baseShape = options?.shape ?? resolveShape(options?.model);
+	const frameSize = options?.frameSize ?? baseShape.frameSize;
+	const high = frameSize === baseShape.frameSize ? baseShape : { ...baseShape, frameSize };
+	const textOnlyCapacity = 2 * TEXT_EDGE_PAGES * geometry(high).capacity;
+	const { archiveText } = buildArchiveText(preparation, options);
+	return {
+		normalizedChars: archiveText.length,
+		textOnlyCapacity,
+		textOnly: archiveText.length <= textOnlyCapacity,
+	};
+}
+
+/**
+ * Run a snapcompact compaction over prepared messages. Fully local: serializes
+ * the discarded history, appends it to the accumulated archive source text, and
+ * re-renders that source into an ordered history layout: plain text at the
+ * oldest edge, imaged middle, then plain text at the newest edge. The imaged
+ * middle itself foveates (HQ/LQ/HQ) when it grows large.
+ *
+ * The full kept source persists on the archive (`text`) so each later compaction
+ * unfolds and re-renders it coherently alongside the newly archived history.
+ *
+ * If the previous compaction was text-based, its summary is printed at the head
+ * of the archive as `[Summary of earlier history]` so no continuity is lost.
+ */
+export async function compact<TMessage = Message>(
+	preparation: CompactionPreparation<TMessage>,
+	options?: Options<TMessage>,
+): Promise<CompactionResult> {
+	const { firstKeptEntryId, tokensBefore, fileOps } = preparation;
+	if (!firstKeptEntryId) {
+		throw new Error("First kept entry has no ID - session may need migration");
+	}
+	const baseShape = options?.shape ?? resolveShape(options?.model);
+	const frameSize = options?.frameSize ?? baseShape.frameSize;
+	const high = frameSize === baseShape.frameSize ? baseShape : { ...baseShape, frameSize };
+	const low = denseCompanion(high, options?.model?.api);
+	const geo = geometry(high);
+	// The engine default caps archive growth; a caller-supplied maxFrames only
+	// lowers it further (an upper limit), never raising it past the default.
+	const maxFrames = Math.max(1, Math.min(options?.maxFrames ?? MAX_FRAMES_DEFAULT, MAX_FRAMES_DEFAULT));
+
+	const { archiveText, previousArchive, includedPreviousSummary } = buildArchiveText(preparation, options);
+	let truncatedChars = previousArchive?.truncatedChars ?? 0;
 
 	const layout = planArchive(archiveText, high, low, maxFrames);
 	truncatedChars += layout.truncatedChars;
@@ -1583,7 +1623,7 @@ export async function compact<TMessage = Message>(
 
 	// A snapcompact pass replaces any provider-side replacement history; strip the
 	// OpenAI remote-compaction payload like the default summarizer path does.
-	const basePreserve = stripOpenAiRemoteCompactionPreserveData(previousPreserveData) ?? {};
+	const basePreserve = stripOpenAiRemoteCompactionPreserveData(preparation.previousPreserveData) ?? {};
 	const persistedText =
 		layout.keptText.length > 0 && layout.textTail.length > 0
 			? `${layout.keptText.slice(0, layout.keptText.length - layout.textTail.length)}${textTail}`

@@ -124,6 +124,78 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	return undefined;
 }
 
+const SNAPCOMPACT_ARCHIVE_MIGRATION_PROMPT_MARGIN = 4_000;
+
+function snapcompactArchiveText(preserveData: Record<string, unknown> | undefined): string | undefined {
+	const archive = snapcompact.getPreservedArchive(preserveData);
+	if (!archive) return undefined;
+	const text =
+		archive.truncatedChars > 0
+			? [
+					archive.textHead,
+					`[... ${archive.truncatedChars.toLocaleString()} archived chars omitted ...]`,
+					archive.textTail,
+				]
+					.filter((part): part is string => typeof part === "string" && part.length > 0)
+					.join("\n\n")
+			: (archive.text ??
+				[archive.textHead, archive.textTail]
+					.filter((part): part is string => typeof part === "string" && part.length > 0)
+					.join("\n\n[... archived middle omitted ...]\n\n"));
+	return text.length > 0 ? text : undefined;
+}
+
+function stripSnapcompactPreserveData(
+	preserveData: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+	if (!preserveData || !(snapcompact.PRESERVE_KEY in preserveData)) return preserveData;
+	const { [snapcompact.PRESERVE_KEY]: _removed, ...rest } = preserveData;
+	return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+function createSnapcompactArchiveMigrationMessage(text: string): AgentMessage {
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `[Archived snapcompact history from earlier compactions]\n\n${text}`,
+			},
+		],
+		timestamp: Date.now(),
+	};
+}
+
+function createSnapcompactArchiveMigration(
+	preparation: CompactionPreparation,
+	model: Model,
+	enabled: boolean,
+	convertToLlm: ConvertToLlm | undefined,
+	shape: snapcompact.Shape | undefined,
+): AgentMessage | undefined {
+	if (!enabled) return undefined;
+	const text = snapcompactArchiveText(preparation.previousPreserveData);
+	if (!text) return undefined;
+	const archiveTokens = countTokens([text]);
+	const contextWindow = model.contextWindow ?? 0;
+	if (contextWindow > 0) {
+		const historyTokens = preparation.messagesToSummarize.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+		const previousSummaryTokens = preparation.previousSummary ? countTokens([preparation.previousSummary]) : 0;
+		const reserveTokens = effectiveReserveTokens(contextWindow, preparation.settings);
+		const availableTokens =
+			contextWindow -
+			reserveTokens -
+			SNAPCOMPACT_ARCHIVE_MIGRATION_PROMPT_MARGIN -
+			historyTokens -
+			previousSummaryTokens;
+		if (archiveTokens > availableTokens) return undefined;
+	} else {
+		const archiveSize = snapcompact.estimateArchiveSize(preparation, { convertToLlm, model, shape });
+		if (!archiveSize.textOnly) return undefined;
+	}
+	return createSnapcompactArchiveMigrationMessage(text);
+}
+
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
 export interface CompactionResult<T = unknown> {
 	summary: string;
@@ -654,6 +726,10 @@ export interface SummaryOptions {
 	thinkingLevel?: ThinkingLevel;
 	/** Optional fetch implementation threaded into remote compaction calls. */
 	fetch?: FetchImpl;
+	/** Fold a preserved snapcompact archive into this text summary and clear it on success. */
+	migrateSnapcompactArchive?: boolean;
+	/** Shape used by the preserved snapcompact archive when checking migration fit. */
+	snapcompactShape?: snapcompact.Shape;
 }
 
 export async function generateSummary(
@@ -1056,10 +1132,25 @@ export async function compact(
 		fetch: options?.fetch,
 	};
 
-	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
+	const migrateSnapcompactArchive = options?.migrateSnapcompactArchive ?? settings.strategy !== "snapcompact";
+	const snapcompactArchiveMigration = createSnapcompactArchiveMigration(
+		preparation,
+		model,
+		migrateSnapcompactArchive,
+		summaryOptions.convertToLlm,
+		options?.snapcompactShape,
+	);
+	const previousPreserveDataForResult = snapcompactArchiveMigration
+		? stripSnapcompactPreserveData(previousPreserveData)
+		: previousPreserveData;
+	const messagesToSummarizeForSummary = snapcompactArchiveMigration
+		? [snapcompactArchiveMigration, ...messagesToSummarize]
+		: messagesToSummarize;
+
+	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveDataForResult, undefined);
 	if (settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model)) {
-		const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
-		const remoteMessages = [...messagesToSummarize, ...turnPrefixMessages, ...recentMessages];
+		const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveDataForResult);
+		const remoteMessages = [...messagesToSummarizeForSummary, ...turnPrefixMessages, ...recentMessages];
 		const previousReplacementHistory =
 			previousRemoteCompaction?.provider === model.provider
 				? previousRemoteCompaction.replacementHistory
@@ -1084,7 +1175,7 @@ export async function compact(
 						),
 					{ signal },
 				);
-				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
+				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveDataForResult, remote);
 			} catch (err) {
 				// A user/session abort is a cancellation, not a remote failure —
 				// swallowing it here would downgrade Esc into "fall back to local
@@ -1105,9 +1196,9 @@ export async function compact(
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Generate both summaries in parallel
 		const [historyResult, turnPrefixResult] = await Promise.all([
-			messagesToSummarize.length > 0
+			messagesToSummarizeForSummary.length > 0
 				? generateSummary(
-						messagesToSummarize,
+						messagesToSummarizeForSummary,
 						model,
 						settings.reserveTokens,
 						apiKey,
@@ -1121,10 +1212,10 @@ export async function compact(
 		]);
 		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
-	} else if (messagesToSummarize.length > 0) {
+	} else if (messagesToSummarizeForSummary.length > 0) {
 		// Generate history summary from messages to summarize
 		summary = await generateSummary(
-			messagesToSummarize,
+			messagesToSummarizeForSummary,
 			model,
 			settings.reserveTokens,
 			apiKey,

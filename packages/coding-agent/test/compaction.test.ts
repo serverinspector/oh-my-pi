@@ -27,6 +27,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { parseSessionEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { migrateSessionEntries } from "@oh-my-pi/pi-coding-agent/session/session-migrations";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { mockFetch } from "./helpers/fetch-mock";
 import { e2eApiKey } from "./utilities";
 
@@ -785,6 +786,112 @@ describe("remote compaction setting", () => {
 		const result = await compact(preparation, model, "test-api-key");
 
 		expect(result.preserveData).toEqual({ otherState: "keep-me" });
+	});
+
+	it("folds preserved snapcompact text into local context-full summaries before clearing it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected anthropic/claude-sonnet-4-5 model to exist");
+
+		const oldUser = createMessageEntry(createUserMessage("Older turn"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("Older answer"));
+		const previousCompaction = createCompactionEntry("Previous summary", oldAssistant.id);
+		previousCompaction.preserveData = {
+			otherState: "keep-me",
+			[snapcompact.PRESERVE_KEY]: {
+				frames: [],
+				totalChars: 22,
+				truncatedChars: 0,
+				text: "LOCAL ARCHIVE DETAIL",
+			},
+		};
+		const entries: SessionEntry[] = [
+			oldUser,
+			oldAssistant,
+			previousCompaction,
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createAssistantMessage("Answer 1", createMockUsage(0, 100, 4000, 0))),
+			createMessageEntry(createUserMessage("Turn 2")),
+			createMessageEntry(createAssistantMessage("Answer 2", createMockUsage(0, 100, 9000, 0))),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1000,
+			remoteEnabled: false,
+			strategy: "context-full",
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const completeSimpleSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("summary"));
+
+		const result = await compact(preparation, model, "test-api-key");
+		const firstPrompt = JSON.stringify(completeSimpleSpy.mock.calls[0]?.[1] ?? {});
+
+		expect(firstPrompt).toContain("Archived snapcompact history");
+		expect(firstPrompt).toContain("LOCAL ARCHIVE DETAIL");
+		expect(result.preserveData).toEqual({ otherState: "keep-me" });
+	});
+
+	it("folds preserved snapcompact text into OpenAI remote compaction before clearing it", async () => {
+		const model = getBundledModel("openai", "gpt-5.1");
+		if (!model) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const oldUser = createMessageEntry(createUserMessage("Older turn"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("Older answer"));
+		const previousCompaction = createCompactionEntry("Previous summary", oldAssistant.id);
+		previousCompaction.preserveData = {
+			otherState: "keep-me",
+			[snapcompact.PRESERVE_KEY]: {
+				frames: [],
+				totalChars: 23,
+				truncatedChars: 0,
+				text: "REMOTE ARCHIVE DETAIL",
+			},
+		};
+		const entries: SessionEntry[] = [
+			oldUser,
+			oldAssistant,
+			previousCompaction,
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 4000, 0))),
+			createMessageEntry(createUserMessage("Turn 2")),
+			createMessageEntry(createOpenAiAssistantMessage("Answer 2", model, createMockUsage(0, 100, 9000, 0))),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1000,
+			remoteEnabled: true,
+			strategy: "snapcompact",
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const remoteOutput = [{ type: "compaction", encrypted_content: "new_encrypted" }];
+		const fetchHandler = vi.fn(
+			async (_input, _init) =>
+				new Response(JSON.stringify({ output: remoteOutput }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		const fetchSpy = mockFetch(fetchHandler);
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("summary"));
+
+		const result = await compact(preparation, model, "test-api-key", undefined, undefined, {
+			fetch: fetchSpy,
+			migrateSnapcompactArchive: true,
+		});
+		const requestBody = JSON.parse(String(fetchHandler.mock.calls[0]?.[1]?.body)) as {
+			input: Array<Record<string, unknown>>;
+		};
+
+		expect(JSON.stringify(requestBody.input)).toContain("REMOTE ARCHIVE DETAIL");
+		expect(result.preserveData).toEqual({
+			otherState: "keep-me",
+			openaiRemoteCompaction: {
+				provider: "openai",
+				replacementHistory: remoteOutput,
+				compactionItem: { type: "compaction", encrypted_content: "new_encrypted" },
+			},
+		});
 	});
 });
 

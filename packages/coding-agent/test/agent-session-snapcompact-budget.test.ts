@@ -255,6 +255,12 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 		const lastEntry = branchEntries[branchEntries.length - 1];
 		if (!lastEntry?.id) throw new Error("Expected branch entry with id");
 
+		vi.spyOn(snapcompact, "estimateArchiveSize").mockReturnValue({
+			normalizedChars: 1000,
+			textOnlyCapacity: 2000,
+			textOnly: true,
+		});
+
 		const compactSpy = vi.spyOn(snapcompact, "compact").mockResolvedValue({
 			summary: "stubbed snapcompact",
 			shortSummary: "stub",
@@ -276,5 +282,35 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 		// even though one frame charge would overflow the budget — the
 		// text-only `planArchive` path makes this case recoverable.
 		expect(opts?.maxFrames).toBe(1);
+	});
+
+	it("skips snapcompact when positive headroom still cannot fit a required frame", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected model");
+		const ctxWindow = model.contextWindow ?? 0;
+		const reserve = Math.max(Math.floor(ctxWindow * 0.15), 16384);
+		const headroomTokens = 1500;
+		const targetRecentTokens = ctxWindow - reserve - headroomTokens;
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "x".repeat(targetRecentTokens * 4) }],
+			timestamp: Date.now(),
+		});
+
+		vi.spyOn(snapcompact, "estimateArchiveSize").mockReturnValue({
+			normalizedChars: 50_000,
+			textOnlyCapacity: 10_000,
+			textOnly: false,
+		});
+		const compactSpy = vi.spyOn(snapcompact, "compact");
+		const notices: { level: string; message: string }[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push({ level: event.level, message: event.message });
+		});
+
+		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toThrow();
+
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(notices.some(n => n.level === "warning" && n.message.includes("archive needs image frames"))).toBe(true);
 	});
 });
