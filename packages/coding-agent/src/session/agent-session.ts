@@ -69,6 +69,7 @@ import {
 	type ShakeRegion,
 	type SummaryOptions,
 	shouldCompact,
+	shouldUseCodexV2RemoteCompaction,
 	shouldUseOpenAiRemoteCompaction,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import {
@@ -353,11 +354,11 @@ export type AgentSessionEvent =
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";
-			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			action: "context-full" | "handoff" | "shake" | "snapcompact" | "codex-v2";
 	  }
 	| {
 			type: "auto_compaction_end";
-			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			action: "context-full" | "handoff" | "shake" | "snapcompact" | "codex-v2";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -8406,19 +8407,24 @@ export class AgentSession {
 			const effectiveSettings = compactMode
 				? { ...compactionSettings, ...compactMode.overrides }
 				: compactionSettings;
-			// /compact remote demands provider-native compaction. When no remote
-			// endpoint is configured (one would override per-model gating in
-			// compact()), drop fallback candidates that aren't remote-capable so the
-			// engine never silently runs a local summary on a configured-but-non-
-			// remote compactionModel. If filtering empties the chain, warn and fall
-			// back to the full chain so the operation still completes.
+			// /compact remote demands provider-native compaction. /compact codex-v2
+			// is stricter: it must use the Responses compaction-trigger path and
+			// must not silently fall back to a local summary.
 			const availableModels = this.#modelRegistry.getAvailable();
+			const requireCodexV2 = effectiveSettings.strategy === "codex-v2";
 			const requireProviderRemote = Boolean(compactMode?.requiresRemote && !effectiveSettings.remoteEndpoint);
-			let compactionCandidates = this.#getCompactionModelCandidates(
-				availableModels,
-				requireProviderRemote ? shouldUseOpenAiRemoteCompaction : undefined,
-			);
-			if (requireProviderRemote && compactionCandidates.length === 0) {
+			const remotePredicate = requireCodexV2
+				? shouldUseCodexV2RemoteCompaction
+				: requireProviderRemote
+					? shouldUseOpenAiRemoteCompaction
+					: undefined;
+			let compactionCandidates = this.#getCompactionModelCandidates(availableModels, remotePredicate);
+			if (requireCodexV2 && compactionCandidates.length === 0) {
+				throw new Error(
+					`Codex V2 compaction requires an OpenAI Responses-capable model (${this.model.id} is not eligible and no eligible fallback is configured).`,
+				);
+			}
+			if (requireProviderRemote && !requireCodexV2 && compactionCandidates.length === 0) {
 				this.emitNotice(
 					"warning",
 					`remote compaction is unavailable for ${this.model.id} (no remote endpoint configured and no provider-native remote-capable model in the fallback chain) — using a local summary instead`,
@@ -8576,6 +8582,7 @@ export class AgentSession {
 							promptOverride: this.#obfuscateTextForProvider(compactionPrep.hookPrompt),
 							extraContext: compactionPrep.hookContext,
 							remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+							tools: this.agent.state.tools,
 							convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
 						},
 						compactionCandidates,
@@ -10291,6 +10298,8 @@ export class AgentSession {
 						...options,
 						metadata: this.agent.metadataForProvider(candidate.provider),
 						convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
+						tools: options?.tools ?? this.agent.state.tools,
+						serviceTier: this.#effectiveServiceTier(candidate),
 						telemetry,
 						// Honor the user's /model thinking selection (incl. `off`) on
 						// the manual `/compact` path. Clamped per-model inside compact()
@@ -10619,12 +10628,14 @@ export class AgentSession {
 		// so a handoff request on the existing context is still viable. Snapcompact is
 		// a local-only strategy: if it cannot run, report the local blocker instead of
 		// silently swapping in a provider-backed summary.
-		let action: "context-full" | "handoff" | "snapcompact" =
+		let action: "context-full" | "handoff" | "snapcompact" | "codex-v2" =
 			compactionSettings.strategy === "snapcompact"
 				? "snapcompact"
-				: compactionSettings.strategy === "handoff" && reason !== "overflow" && !suppressHandoff
-					? "handoff"
-					: "context-full";
+				: compactionSettings.strategy === "codex-v2"
+					? "codex-v2"
+					: compactionSettings.strategy === "handoff" && reason !== "overflow" && !suppressHandoff
+						? "handoff"
+						: "context-full";
 		// Abort any older auto-compaction before installing this run's controller.
 		this.#autoCompactionAbortController?.abort();
 		const autoCompactionAbortController = new AbortController();
@@ -10857,7 +10868,15 @@ export class AgentSession {
 				details = snapcompactResult.details;
 				preserveData = { ...(compactionPrep.preserveData ?? {}), ...(snapcompactResult.preserveData ?? {}) };
 			} else {
-				const candidates = this.#getCompactionModelCandidates(availableModels);
+				const candidates = this.#getCompactionModelCandidates(
+					availableModels,
+					compactionSettings.strategy === "codex-v2" ? shouldUseCodexV2RemoteCompaction : undefined,
+				);
+				if (compactionSettings.strategy === "codex-v2" && candidates.length === 0) {
+					throw new Error(
+						`Codex V2 compaction requires an OpenAI Responses-capable model (${this.model.id} is not eligible and no eligible fallback is configured).`,
+					);
+				}
 				const retrySettings = this.settings.getGroup("retry");
 				const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 				let compactResult: CompactionResult | undefined;
@@ -10885,6 +10904,8 @@ export class AgentSession {
 									metadata: this.agent.metadataForProvider(candidate.provider),
 									initiatorOverride: "agent",
 									convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
+									tools: this.agent.state.tools,
+									serviceTier: this.#effectiveServiceTier(candidate),
 									telemetry,
 									// Honor the user's /model thinking selection on the
 									// auto-compaction path — the most-fired compaction

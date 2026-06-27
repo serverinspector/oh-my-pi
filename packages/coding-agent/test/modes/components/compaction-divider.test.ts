@@ -11,6 +11,8 @@ import { createCompactionSummaryMessage } from "@oh-my-pi/pi-agent-core/compacti
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { CompactionSummaryMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/compaction-summary-message";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import type { CompactionEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 beforeAll(() => {
 	initTheme();
@@ -44,6 +46,84 @@ describe("CompactionSummaryMessageComponent", () => {
 		expect(text).toContain(SUMMARY);
 		expect(text).toContain("tokens");
 		expect(text).toContain("1 snapcompact frame attached");
+	});
+
+	it("collapsed: names Codex V2 native compactions in the transcript", () => {
+		const component = new CompactionSummaryMessageComponent(
+			createCompactionSummaryMessage(
+				"Context compacted by Codex V2 remote compaction. Provider-native replacement history carries the retained context.",
+				128000,
+				new Date().toISOString(),
+				"Codex V2 remote compaction",
+			),
+		);
+		const collapsed = Bun.stripANSI(component.render(80).join("\n"));
+		expect(collapsed).toContain("Codex V2 compacted");
+		expect(collapsed).toContain("ctrl+o");
+		expect(collapsed).not.toContain("Provider-native replacement history");
+
+		const narrow = Bun.stripANSI(component.render(32).join("\n"));
+		expect(narrow).toContain("Codex V2 compacted");
+		expect(narrow).toContain("─");
+		expect(narrow).not.toContain("Provider-native replacement history");
+
+		component.setExpanded(true);
+		const expanded = Bun.stripANSI(component.render(80).join("\n"));
+		expect(expanded).toContain("Codex V2 provider-native compaction item attached");
+	});
+
+	it("renders the collapsed transcript marker for a codex-v2 compact entry", () => {
+		const timestamp = new Date().toISOString();
+		const oldUser: SessionEntry = {
+			type: "message",
+			id: "old-user",
+			parentId: null,
+			timestamp,
+			message: { role: "user", content: "old context", timestamp: Date.now() },
+		};
+		const keptUser: SessionEntry = {
+			type: "message",
+			id: "kept-user",
+			parentId: oldUser.id,
+			timestamp,
+			message: { role: "user", content: "kept context", timestamp: Date.now() },
+		};
+		const compaction: CompactionEntry = {
+			type: "compaction",
+			id: "codex-v2-compact",
+			parentId: keptUser.id,
+			timestamp,
+			summary:
+				"Context compacted by Codex V2 remote compaction. Provider-native replacement history carries the retained context.",
+			shortSummary: "Codex V2 remote compaction",
+			firstKeptEntryId: keptUser.id,
+			tokensBefore: 128000,
+			preserveData: {
+				openaiRemoteCompaction: {
+					provider: "openai-codex",
+					method: "codex-v2",
+					replacementHistory: [
+						{ type: "message", role: "user", content: [{ type: "input_text", text: "kept context" }] },
+						{ type: "compaction", encrypted_content: "encrypted" },
+					],
+					compactionItem: { type: "compaction", encrypted_content: "encrypted" },
+				},
+			},
+		};
+
+		const transcript = buildSessionContext([oldUser, keptUser, compaction], undefined, undefined, {
+			transcript: true,
+			collapseCompactedHistory: true,
+		});
+
+		expect(transcript.messages.map(message => message.role)).toEqual(["compactionSummary", "user"]);
+		const summaryMessage = transcript.messages[0];
+		if (summaryMessage?.role !== "compactionSummary") {
+			throw new Error("collapsed transcript did not expose the compaction marker");
+		}
+		const rendered = Bun.stripANSI(new CompactionSummaryMessageComponent(summaryMessage).render(32).join("\n"));
+		expect(rendered).toContain("Codex V2 compacted");
+		expect(rendered).toContain("─");
 	});
 
 	it("degrades to a bare label when the viewport is too narrow for a framed rule", () => {

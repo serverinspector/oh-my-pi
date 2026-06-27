@@ -14,12 +14,14 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
+	type ServiceTier,
 	type SimpleStreamOptions,
 	type Tool,
 	type Usage,
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { createOpenAIResponsesHistoryPayload, getOpenAIResponsesHistoryItems } from "@oh-my-pi/pi-ai/utils";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -29,13 +31,24 @@ import { ThinkingLevel } from "../thinking";
 import { countTokens } from "../tokenizer";
 import type { AgentMessage } from "../types";
 import type { CompactionEntry, SessionEntry } from "./entries";
-import { type ConvertToLlm, createBranchSummaryMessage, createCustomMessage, defaultConvertToLlm } from "./messages";
 import {
-	buildOpenAiNativeHistory,
+	type ConvertToLlm,
+	createBranchSummaryMessage,
+	createCustomMessage,
+	defaultConvertToLlm,
+	markCodexV2RetainedMessage,
+} from "./messages";
+import {
+	buildCodexV2ReplacementHistory,
+	buildOpenAiNativeHistoryWithCodexV2Retention,
 	getPreservedOpenAiRemoteCompactionData,
+	isCodexV2CompactionItem,
+	type OpenAiRemoteCompactionPreserveData,
 	requestOpenAiRemoteCompaction,
 	requestRemoteCompaction,
+	shouldUseCodexV2RemoteCompaction,
 	shouldUseOpenAiRemoteCompaction,
+	trimCodexV2CompactionInputToFitContextWindow,
 	withOpenAiRemoteCompactionPreserveData,
 } from "./openai";
 import autoHandoffThresholdFocusPrompt from "./prompts/auto-handoff-threshold-focus.md" with { type: "text" };
@@ -146,7 +159,7 @@ export interface CompactionResult<T = unknown> {
 
 export interface CompactionSettings {
 	enabled: boolean;
-	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
+	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "codex-v2" | "off";
 	thresholdPercent?: number;
 	thresholdTokens?: number;
 	midTurnEnabled?: boolean;
@@ -641,6 +654,8 @@ export interface SummaryOptions {
 	initiatorOverride?: MessageAttribution;
 	metadata?: Record<string, unknown>;
 	convertToLlm?: ConvertToLlm;
+	tools?: Tool[];
+	serviceTier?: ServiceTier;
 	/**
 	 * Optional telemetry handle. When provided, every LLM call emitted during
 	 * compaction is wrapped in an OTEL chat span tagged with
@@ -661,6 +676,80 @@ export interface SummaryOptions {
 	fetch?: FetchImpl;
 }
 
+const CODEX_V2_COMPACTION_SUMMARY =
+	"Context compacted by Codex V2 remote compaction. Provider-native replacement history carries the retained context.";
+const CODEX_V2_COMPACTION_SHORT_SUMMARY = "Codex V2 remote compaction";
+const CODEX_V2_COMPACTION_STREAM_IDLE_TIMEOUT_MS = 300_000;
+
+async function requestCodexV2RemoteCompactionViaProvider(
+	model: Model,
+	apiKey: ApiKey,
+	remoteHistory: Array<Record<string, unknown>>,
+	codexV2RetainedItems: Array<Record<string, unknown>>,
+	instructions: string,
+	signal: AbortSignal | undefined,
+	options: SummaryOptions,
+): Promise<OpenAiRemoteCompactionPreserveData> {
+	if (!shouldUseCodexV2RemoteCompaction(model)) {
+		throw new Error(`Codex V2 compaction requires an OpenAI Responses-capable model (${model.provider}/${model.id})`);
+	}
+	const compactInput = trimCodexV2CompactionInputToFitContextWindow(
+		remoteHistory,
+		model.contextWindow ?? Number.POSITIVE_INFINITY,
+		instructions,
+	);
+	const requestHistory = [...compactInput, { type: "compaction_trigger" }];
+	const response = await instrumentedCompleteSimple(
+		model,
+		{
+			systemPrompt: [instructions],
+			messages: [
+				{
+					role: "user" as const,
+					content: "",
+					providerPayload: createOpenAIResponsesHistoryPayload(model.provider, requestHistory, false),
+					timestamp: Date.now(),
+				},
+			],
+			tools: options.tools,
+		},
+		{
+			signal,
+			apiKey,
+			reasoning: resolveCompactionEffort(model, options.thinkingLevel),
+			initiatorOverride: options.initiatorOverride,
+			serviceTier: options.serviceTier,
+			streamIdleTimeoutMs: CODEX_V2_COMPACTION_STREAM_IDLE_TIMEOUT_MS,
+			streamFirstEventTimeoutMs: CODEX_V2_COMPACTION_STREAM_IDLE_TIMEOUT_MS,
+			metadata: options.metadata,
+			fetch: options.fetch,
+		},
+		{ telemetry: options.telemetry, oneshotKind: "codex_v2_compaction" },
+	);
+	if (response.stopReason === "error") {
+		throw createSummarizationError("Codex V2 remote compaction failed", response);
+	}
+
+	const outputItems =
+		getOpenAIResponsesHistoryItems(response.providerPayload, model.provider, response.provider) ?? [];
+	const compactionItems = outputItems.filter(isCodexV2CompactionItem);
+	if (compactionItems.length !== 1) {
+		throw new Error(
+			`Codex V2 remote compaction expected exactly one compaction output item, got ${compactionItems.length} from ${outputItems.length} output items`,
+		);
+	}
+	const compactionItem = compactionItems[0];
+	if (!compactionItem) {
+		throw new Error("Codex V2 remote compaction missing compaction output item");
+	}
+	return {
+		provider: model.provider,
+		method: "codex-v2",
+		replacementHistory: buildCodexV2ReplacementHistory(codexV2RetainedItems, compactionItem),
+		compactionItem,
+	};
+}
+
 function formatPreviousSnapcompactArchive(archiveText: string): string {
 	return prompt.render(snapcompactArchiveContextPrompt, { archiveText });
 }
@@ -675,11 +764,14 @@ function mergePreviousSummaryWithSnapcompactArchive(
 }
 
 function createSnapcompactArchiveMigrationMessage(archiveText: string): Message {
-	return {
-		role: "user",
-		content: [{ type: "text", text: formatPreviousSnapcompactArchive(archiveText) }],
-		timestamp: Date.now(),
-	};
+	return markCodexV2RetainedMessage(
+		{
+			role: "user",
+			content: [{ type: "text", text: formatPreviousSnapcompactArchive(archiveText) }],
+			timestamp: Date.now(),
+		},
+		false,
+	);
 }
 
 export async function generateSummary(
@@ -1115,6 +1207,8 @@ export async function compact(
 		initiatorOverride: options?.initiatorOverride,
 		metadata: options?.metadata,
 		convertToLlm: options?.convertToLlm,
+		tools: options?.tools,
+		serviceTier: options?.serviceTier,
 		telemetry: options?.telemetry,
 		// Honor /model thinking selection on every fan-out summarizer.
 		// Without this propagation, generateSummary / generateTurnPrefixSummary
@@ -1137,51 +1231,86 @@ export async function compact(
 		? createSnapcompactArchiveMigrationMessage(previousSnapcompactArchiveText)
 		: undefined;
 
+	const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
+	const previousReplacementHistory =
+		previousRemoteCompaction?.provider === model.provider &&
+		(settings.strategy !== "codex-v2" || previousRemoteCompaction.method === "codex-v2")
+			? previousRemoteCompaction.replacementHistory
+			: undefined;
+	const remoteMessages: AgentMessage[] = [
+		...(snapcompactArchiveMigrationMessage ? [snapcompactArchiveMigrationMessage] : []),
+		...messagesToSummarize,
+		...turnPrefixMessages,
+		...recentMessages,
+	];
+	const { history: remoteHistory, codexV2RetainedItems } = buildOpenAiNativeHistoryWithCodexV2Retention(
+		(summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages),
+		model,
+		previousReplacementHistory,
+	);
+
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
-	if (settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model)) {
-		const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
-		const remoteMessages: AgentMessage[] = [
-			...(snapcompactArchiveMigrationMessage ? [snapcompactArchiveMigrationMessage] : []),
-			...messagesToSummarize,
-			...turnPrefixMessages,
-			...recentMessages,
-		];
-		const previousReplacementHistory =
-			previousRemoteCompaction?.provider === model.provider
-				? previousRemoteCompaction.replacementHistory
-				: undefined;
-		const remoteHistory = buildOpenAiNativeHistory(
-			(summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages),
+	if (settings.strategy === "codex-v2") {
+		if (remoteHistory.length === 0) {
+			throw new Error("Codex V2 compaction requires non-empty OpenAI Responses history");
+		}
+		if (!summaryOptions.remoteInstructions) {
+			throw new Error("Codex V2 compaction requires base session instructions");
+		}
+		if (!summaryOptions.tools) {
+			throw new Error("Codex V2 compaction requires current tool definitions");
+		}
+		const remote = await requestCodexV2RemoteCompactionViaProvider(
 			model,
-			previousReplacementHistory,
+			apiKey,
+			remoteHistory,
+			codexV2RetainedItems,
+			summaryOptions.remoteInstructions,
+			signal,
+			summaryOptions,
 		);
-		if (remoteHistory.length > 0) {
-			try {
-				const remote = await withAuth(
-					apiKey,
-					key =>
-						requestOpenAiRemoteCompaction(
-							model,
-							key,
-							remoteHistory,
-							summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PROMPT,
-							signal,
-							{ fetch: summaryOptions.fetch },
-						),
-					{ signal },
-				);
-				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
-			} catch (err) {
-				// A user/session abort is a cancellation, not a remote failure —
-				// swallowing it here would downgrade Esc into "fall back to local
-				// summarization" and keep compaction running on an aborted signal.
-				if (signal?.aborted) throw err;
-				logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
-					error: err instanceof Error ? err.message : String(err),
-					model: model.id,
-					provider: model.provider,
-				});
-			}
+		preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
+		const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+		const summary = upsertFileOperations(CODEX_V2_COMPACTION_SUMMARY, readFiles, modifiedFiles, fileOps.read);
+		if (!firstKeptEntryId) {
+			throw new Error("First kept entry has no ID - session may need migration");
+		}
+		return {
+			summary,
+			shortSummary: CODEX_V2_COMPACTION_SHORT_SUMMARY,
+			firstKeptEntryId,
+			tokensBefore,
+			details: { readFiles, modifiedFiles } as CompactionDetails,
+			preserveData: previousSnapcompactArchive ? snapcompact.stripPreservedArchive(preserveData) : preserveData,
+		};
+	}
+
+	if (settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model) && remoteHistory.length > 0) {
+		try {
+			const remote = await withAuth(
+				apiKey,
+				key =>
+					requestOpenAiRemoteCompaction(
+						model,
+						key,
+						remoteHistory,
+						summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PROMPT,
+						signal,
+						{ fetch: summaryOptions.fetch },
+					),
+				{ signal },
+			);
+			preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
+		} catch (err) {
+			// A user/session abort is a cancellation, not a remote failure —
+			// swallowing it here would downgrade Esc into "fall back to local
+			// summarization" and keep compaction running on an aborted signal.
+			if (signal?.aborted) throw err;
+			logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
+				error: err instanceof Error ? err.message : String(err),
+				model: model.id,
+				provider: model.provider,
+			});
 		}
 	}
 

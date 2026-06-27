@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an isolated Codex V2-style Responses compaction path that appends a `compaction_trigger`, requires exactly one provider `compaction` output item, and stores retained native replacement history for replay without running local text summaries.
+
 ## [16.2.2] - 2026-06-27
 
 ### Added

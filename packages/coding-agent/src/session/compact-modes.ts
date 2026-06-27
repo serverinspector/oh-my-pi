@@ -12,7 +12,7 @@
  */
 
 /** Subcommand selecting a one-off compaction mode for manual `/compact`. */
-export type CompactMode = "soft" | "remote" | "snapcompact";
+export type CompactMode = "soft" | "remote" | "snapcompact" | "codex-v2";
 
 /**
  * Per-invocation overrides merged over the configured `compaction.*` settings.
@@ -20,7 +20,7 @@ export type CompactMode = "soft" | "remote" | "snapcompact";
  * assignable to the full `CompactionSettings`.
  */
 export interface CompactionOverride {
-	strategy?: "context-full" | "snapcompact";
+	strategy?: "context-full" | "snapcompact" | "codex-v2";
 	remoteEnabled?: boolean;
 }
 
@@ -55,6 +55,13 @@ export const COMPACT_MODES: readonly CompactModeDef[] = [
 		description: "Summarize via the remote endpoint / provider-native compaction",
 		overrides: { strategy: "context-full", remoteEnabled: true },
 		requiresRemote: true,
+	},
+	{
+		name: "codex-v2",
+		description: "Compact via OpenAI Responses compaction trigger and preserve provider-native history",
+		overrides: { strategy: "codex-v2", remoteEnabled: true },
+		requiresRemote: true,
+		rejectsFocus: true,
 	},
 	{
 		name: "snapcompact",

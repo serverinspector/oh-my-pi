@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a selectable Codex V2 compaction strategy and `/compact codex-v2` mode that use provider-native Responses replacement history while keeping legacy remote compaction unchanged.
+
 ## [16.2.2] - 2026-06-27
 
 ### Added

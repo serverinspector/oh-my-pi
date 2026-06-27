@@ -43,18 +43,27 @@ class SummaryDividerComponent implements Component {
 		const label = this.options.label();
 		// sep.dot ships pre-padded (" · "); trim so the hint joins with single spaces.
 		const hint = `${theme.sep.dot.trim()} ctrl+o`;
-		const plainWidth = Bun.stringWidth(`${label} ${hint}`, { countAnsiEscapeCodes: false });
-		// ` label hint ` framed by rules on both sides.
+		const labelWidth = Bun.stringWidth(label, { countAnsiEscapeCodes: false });
+		const labelWithHintWidth = Bun.stringWidth(`${label} ${hint}`, { countAnsiEscapeCodes: false });
+		// ` label hint ` framed by rules on both sides. If the label is too wide
+		// for the hint, keep the rule and drop only the hint; a compaction marker
+		// should still look like a divider in narrow panes.
+		const withHint = this.#framedRule(width, rule, label, labelWithHintWidth, ` ${hint}`);
+		if (withHint) return withHint;
+		const withoutHint = this.#framedRule(width, rule, label, labelWidth, "");
+		if (withoutHint) return withoutHint;
+		return theme.fg("muted", label);
+	}
+
+	#framedRule(width: number, rule: string, label: string, plainWidth: number, suffix: string): string | undefined {
+		// ` label suffix ` framed by rules on both sides.
 		const remaining = width - plainWidth - 2;
-		if (remaining < 4) {
-			// Too narrow for a framed rule — emit the bare label.
-			return theme.fg("muted", label);
-		}
+		if (remaining < 4) return undefined;
 		const left = Math.floor(remaining / 2);
 		const right = remaining - left;
 		return (
 			theme.fg("dim", rule.repeat(left)) +
-			` ${theme.fg("muted", label)} ${theme.fg("dim", hint)} ` +
+			` ${theme.fg("muted", label)}${theme.fg("dim", suffix)} ` +
 			theme.fg("dim", rule.repeat(right))
 		);
 	}
@@ -87,7 +96,7 @@ export class CompactionSummaryMessageComponent implements Component {
 
 	constructor(private readonly message: CompactionSummaryMessage) {
 		this.#divider = new SummaryDividerComponent({
-			label: () => `${theme.icon.camera} compacted`,
+			label: () => this.#label(),
 			detailMarkdown: () => this.#detailMarkdown(),
 		});
 	}
@@ -104,12 +113,23 @@ export class CompactionSummaryMessageComponent implements Component {
 		return this.#divider.render(width);
 	}
 
+	#label(): string {
+		return this.#isCodexV2() ? `${theme.icon.context} Codex V2 compacted` : `${theme.icon.camera} compacted`;
+	}
 	#detailMarkdown(): string {
 		const tokenStr = this.message.tokensBefore.toLocaleString();
 		const frameCount = this.message.images?.length ?? 0;
 		const frameNote =
 			frameCount > 0 ? `\n\n_${frameCount} snapcompact frame${frameCount === 1 ? "" : "s"} attached_` : "";
-		return `**Compacted from ${tokenStr} tokens**\n\n${this.message.summary}${frameNote}`;
+		const codexV2Note = this.#isCodexV2() ? "\n\n_Codex V2 provider-native compaction item attached_" : "";
+		return `**Compacted from ${tokenStr} tokens**\n\n${this.message.summary}${frameNote}${codexV2Note}`;
+	}
+
+	#isCodexV2(): boolean {
+		return (
+			this.message.shortSummary === "Codex V2 remote compaction" ||
+			this.message.summary.startsWith("Context compacted by Codex V2 remote compaction.")
+		);
 	}
 }
 

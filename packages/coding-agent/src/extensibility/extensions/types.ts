@@ -291,7 +291,7 @@ export interface CompactOptions {
 	/**
 	 * Force a one-off compaction mode for this invocation, overriding the
 	 * configured `compaction.strategy` / `remoteEnabled` (the `/compact`
-	 * subcommands: `soft` | `remote` | `snapcompact`). Omitted = configured behavior.
+	 * subcommands: `soft` | `remote` | `snapcompact` | `codex-v2`). Omitted = configured behavior.
 	 */
 	mode?: CompactMode;
 }

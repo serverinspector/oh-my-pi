@@ -14,6 +14,17 @@ import compactionSummaryContextPrompt from "./prompts/compaction-summary-context
 const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
 const BRANCH_SUMMARY_TEMPLATE = branchSummaryContextPrompt;
 
+const codexV2RetainMessages = new WeakMap<Message, boolean>();
+
+export function markCodexV2RetainedMessage<T extends Message>(message: T, retained: boolean): T {
+	codexV2RetainMessages.set(message, retained);
+	return message;
+}
+
+export function shouldRetainMessageForCodexV2(message: Message): boolean {
+	return codexV2RetainMessages.get(message) === true;
+}
+
 export interface CustomMessage<T = unknown> {
 	role: "custom";
 	customType: string;
@@ -176,40 +187,46 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 				};
 			}
 			case "branchSummary":
-				return {
-					role: "user",
-					content: [
-						{
-							type: "text" as const,
-							text: renderBranchSummaryContext(message.summary),
-						},
-					],
-					attribution: "agent",
-					timestamp: message.timestamp,
-				};
+				return markCodexV2RetainedMessage(
+					{
+						role: "user",
+						content: [
+							{
+								type: "text" as const,
+								text: renderBranchSummaryContext(message.summary),
+							},
+						],
+						attribution: "agent",
+						timestamp: message.timestamp,
+					},
+					false,
+				);
 			case "compactionSummary":
-				return {
-					role: "user",
-					content:
-						message.blocks !== undefined
-							? [{ type: "text" as const, text: message.summary }, ...message.blocks]
-							: [
-									{
-										type: "text" as const,
-										text: renderCompactionSummaryContext(message.summary),
-									},
-									...(message.images ?? []),
-								],
-					attribution: "agent",
-					providerPayload: message.providerPayload,
-					timestamp: message.timestamp,
-				};
+				return markCodexV2RetainedMessage(
+					{
+						role: "user",
+						content:
+							message.blocks !== undefined
+								? [{ type: "text" as const, text: message.summary }, ...message.blocks]
+								: [
+										{
+											type: "text" as const,
+											text: renderCompactionSummaryContext(message.summary),
+										},
+										...(message.images ?? []),
+									],
+						attribution: "agent",
+						providerPayload: message.providerPayload,
+						timestamp: message.timestamp,
+					},
+					false,
+				);
 		}
 	}
 
 	switch (message.role) {
 		case "user":
-			return { ...message, attribution: message.attribution ?? "user" };
+			return markCodexV2RetainedMessage({ ...message, attribution: message.attribution ?? "user" }, true);
 		case "developer":
 			return { ...message, attribution: message.attribution ?? "agent" };
 		case "assistant":

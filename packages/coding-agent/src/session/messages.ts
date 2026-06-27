@@ -9,6 +9,7 @@ import {
 	type BranchSummaryMessage,
 	type CompactionSummaryMessage,
 	convertMessageToLlm,
+	markCodexV2RetainedMessage,
 } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type {
 	AssistantMessage,
@@ -497,24 +498,30 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					return [];
 				}
 				return [
-					{
-						role: "user",
-						content: [{ type: "text", text: bashExecutionToText(m) }],
-						attribution: "user",
-						timestamp: m.timestamp,
-					},
+					markCodexV2RetainedMessage(
+						{
+							role: "user",
+							content: [{ type: "text", text: bashExecutionToText(m) }],
+							attribution: "user",
+							timestamp: m.timestamp,
+						},
+						false,
+					),
 				];
 			case "pythonExecution":
 				if (m.excludeFromContext) {
 					return [];
 				}
 				return [
-					{
-						role: "user",
-						content: [{ type: "text", text: pythonExecutionToText(m) }],
-						attribution: "user",
-						timestamp: m.timestamp,
-					},
+					markCodexV2RetainedMessage(
+						{
+							role: "user",
+							content: [{ type: "text", text: pythonExecutionToText(m) }],
+							attribution: "user",
+							timestamp: m.timestamp,
+						},
+						false,
+					),
 				];
 			case "fileMention": {
 				// One `fileMention` can mix `@notes.md` (text) and `@screenshot.png` (image)
@@ -546,12 +553,17 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					for (const file of imageFiles) {
 						if (file.image) content.push(file.image);
 					}
-					out.push({
-						role: "user",
-						content,
-						attribution: "user",
-						timestamp: m.timestamp,
-					});
+					out.push(
+						markCodexV2RetainedMessage(
+							{
+								role: "user",
+								content,
+								attribution: "user",
+								timestamp: m.timestamp,
+							},
+							true,
+						),
+					);
 				}
 				return out;
 			}

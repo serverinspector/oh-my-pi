@@ -97,4 +97,15 @@ describe("settings layout", () => {
 			group: "Services",
 		});
 	});
+
+	it("exposes Codex V2 compaction in the context settings menu", () => {
+		const def = getSettingsForTab("context").find(def => def.path === "compaction.strategy");
+
+		expect(def).toMatchObject({
+			type: "submenu",
+			label: "Compaction Strategy",
+			group: "Compaction",
+		});
+		expect(def && "options" in def ? def.options.map(option => option.value) : []).toContain("codex-v2");
+	});
 });

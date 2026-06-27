@@ -5,13 +5,20 @@ import {
 	createFileOps,
 	DEFAULT_COMPACTION_SETTINGS,
 } from "@oh-my-pi/pi-agent-core/compaction";
+import { markCodexV2RetainedMessage } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import {
+	buildCodexV2ReplacementHistory,
 	buildOpenAiNativeHistory,
+	buildOpenAiNativeHistoryWithCodexV2Retention,
 	requestOpenAiRemoteCompaction,
+	shouldUseCodexV2RemoteCompaction,
 	shouldUseOpenAiRemoteCompaction,
+	trimCodexV2CompactionInputToFitContextWindow,
 } from "@oh-my-pi/pi-agent-core/compaction/openai";
 import * as ai from "@oh-my-pi/pi-ai";
-import type { AssistantMessage, FetchImpl, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import { buildParams as buildOpenAIResponsesParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import type { AssistantMessage, FetchImpl, Model, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
@@ -249,6 +256,111 @@ describe("remote compaction input trimming", () => {
 		expect(requestInput?.some(item => item.type === "custom_tool_call")).toBe(false);
 		expect(requestInput?.some(item => item.type === "custom_tool_call_output")).toBe(false);
 	});
+
+	test("rewrites trailing tool outputs for Codex V2 compaction input overflow", () => {
+		const trimmed = trimCodexV2CompactionInputToFitContextWindow(
+			[
+				{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" },
+				{ type: "function_call_output", call_id: "call_1", output: "x".repeat(10_000) },
+			],
+			1,
+			"compact",
+		);
+
+		expect(trimmed).toEqual([
+			{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" },
+			{
+				type: "function_call_output",
+				call_id: "call_1",
+				output: "Output exceeded the available model context and was truncated",
+			},
+		]);
+	});
+});
+
+describe("Codex V2 replacement history", () => {
+	test("drops instruction wrappers and retains user messages before appending the compaction item", () => {
+		const compactionItem = { type: "compaction" as const, encrypted_content: "sealed" };
+		const history = buildCodexV2ReplacementHistory(
+			[
+				{ type: "message", role: "system", content: [{ type: "input_text", text: "system" }] },
+				{ type: "message", role: "developer", content: [{ type: "input_text", text: "developer" }] },
+				{ type: "message", role: "assistant", content: [{ type: "output_text", text: "assistant" }] },
+				{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" },
+				{ type: "function_call_output", call_id: "call_1", output: "result" },
+				{ type: "message", role: "user", content: [{ type: "input_text", text: "user" }] },
+			],
+			compactionItem,
+		);
+
+		expect(history.map(item => item.type)).toEqual(["message", "compaction"]);
+		expect(history.slice(0, -1).map(item => item.role)).toEqual(["user"]);
+		expect(history.at(-1)).toEqual(compactionItem);
+	});
+
+	test("middle-truncates an oversized retained user message", () => {
+		const compactionItem = { type: "compaction" as const, encrypted_content: "sealed" };
+		const history = buildCodexV2ReplacementHistory(
+			[
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: `START ${"x".repeat(300_000)} END` }],
+				},
+			],
+			compactionItem,
+		);
+		const retained = history[0];
+		const block = Array.isArray(retained?.content) ? retained.content[0] : undefined;
+		if (!block || typeof block !== "object" || !("text" in block) || typeof block.text !== "string") {
+			throw new Error("expected retained text block");
+		}
+		expect(block.text.startsWith("START")).toBe(true);
+		expect(block.text).toContain("tokens truncated");
+		expect(block.text.endsWith("END")).toBe(true);
+		expect(history.at(-1)).toEqual(compactionItem);
+	});
+
+	test("carries explicit Codex V2 retention decisions through native history conversion", () => {
+		const staleResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "missing_call",
+			toolName: "read",
+			content: [{ type: "text", text: "stale result" }],
+			isError: false,
+			timestamp: 3,
+		};
+		const { history, codexV2RetainedItems } = buildOpenAiNativeHistoryWithCodexV2Retention(
+			[
+				markCodexV2RetainedMessage({ role: "user", content: "operator", timestamp: 1 }, true),
+				markCodexV2RetainedMessage({ role: "user", content: "generated wrapper", timestamp: 2 }, false),
+				staleResult,
+			],
+			makeOpenAiModel(),
+		);
+
+		expect(
+			history.filter(item => item.type === "message" && item.role === "user").flatMap(item => item.content),
+		).toContainEqual({
+			type: "input_text",
+			text: '<stale-tool-result tool="read" id="missing_call">\nstale result\n</stale-tool-result>',
+		});
+		expect(codexV2RetainedItems.flatMap(item => item.content)).toEqual([{ type: "input_text", text: "operator" }]);
+	});
+
+	test("gates Codex V2 to OpenAI Responses-capable models", () => {
+		expect(shouldUseCodexV2RemoteCompaction(makeOpenAiModel())).toBe(true);
+		expect(shouldUseCodexV2RemoteCompaction(makeAzureModel())).toBe(false);
+		expect(
+			shouldUseCodexV2RemoteCompaction(
+				makeOpenAiModel({
+					provider: "cliproxy-codex",
+					baseUrl: "http://127.0.0.1:8317/v1",
+					remoteCompaction: { enabled: true, api: "openai-responses" },
+				}),
+			),
+		).toBe(true);
+	});
 });
 
 test("uses configured OpenAI-compatible compaction for custom providers", async () => {
@@ -417,6 +529,20 @@ describe("compact() remote compaction failure handling", () => {
 		};
 	}
 
+	function codexV2CompactionMessage(items: Array<Record<string, unknown>>): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [],
+			timestamp: Date.now(),
+			provider: "openai",
+			model: "gpt-5",
+			api: "openai-responses",
+			usage: ZERO_USAGE,
+			stopReason: "stop",
+			providerPayload: { type: "openaiResponsesHistory", provider: "openai", items },
+		};
+	}
+
 	function makePreparation(): CompactionPreparation {
 		return {
 			firstKeptEntryId: "kept-1",
@@ -467,5 +593,111 @@ describe("compact() remote compaction failure handling", () => {
 
 		expect(result.summary).toContain("local summary");
 		expect(completeSpy).toHaveBeenCalled();
+	});
+
+	test("codex-v2 strategy installs provider replacement history without local summary calls", async () => {
+		const compactionItem = { type: "compaction", encrypted_content: "sealed" };
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(codexV2CompactionMessage([compactionItem]));
+		const tool = {
+			name: "read",
+			description: "Read a file",
+			parameters: { type: "object", properties: {}, additionalProperties: false },
+		} as Tool;
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, strategy: "codex-v2" };
+
+		const result = await compact(preparation, makeOpenAiModel(), "test-key", undefined, undefined, {
+			remoteInstructions: "base instructions",
+			serviceTier: "priority",
+			tools: [tool],
+		});
+
+		expect(result.summary).toContain("Codex V2 remote compaction");
+		expect(result.shortSummary).toBe("Codex V2 remote compaction");
+		const remote = result.preserveData?.openaiRemoteCompaction as
+			| { method?: string; replacementHistory?: Array<Record<string, unknown>> }
+			| undefined;
+		expect(remote?.method).toBe("codex-v2");
+		expect(remote?.replacementHistory?.map(item => item.type)).toEqual(["message", "message", "compaction"]);
+		const context = completeSpy.mock.calls[0]?.[1] as
+			| { messages?: Array<{ providerPayload?: { items?: Array<Record<string, unknown>> } }>; tools?: Tool[] }
+			| undefined;
+		expect(context?.tools).toEqual([tool]);
+		expect(context?.messages?.[0]?.providerPayload?.items?.at(-1)).toEqual({ type: "compaction_trigger" });
+		const options = completeSpy.mock.calls[0]?.[2] as
+			| {
+					maxTokens?: number;
+					serviceTier?: string;
+					streamFirstEventTimeoutMs?: number;
+					streamIdleTimeoutMs?: number;
+			  }
+			| undefined;
+		expect(options?.serviceTier).toBe("priority");
+		expect(options?.streamIdleTimeoutMs).toBe(300_000);
+		expect(options?.streamFirstEventTimeoutMs).toBe(300_000);
+		expect(options).not.toHaveProperty("maxTokens");
+		expect(completeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	test("codex-v2 Responses payload is stateless and ZDR-friendly", () => {
+		const model = makeOpenAiModel();
+		const inputItems = [
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "operator" }] },
+			{ type: "compaction_trigger" },
+		];
+		const { params } = buildOpenAIResponsesParams(
+			model,
+			{
+				systemPrompt: ["base instructions"],
+				messages: [
+					{
+						role: "user",
+						content: "",
+						providerPayload: createOpenAIResponsesHistoryPayload(model.provider, inputItems, false),
+						timestamp: 1,
+					},
+				],
+			},
+			{ serviceTier: "priority" },
+			undefined,
+		);
+
+		expect(params.store).toBe(false);
+		expect("previous_response_id" in params).toBe(false);
+		expect(params.service_tier).toBe("priority");
+		if (!Array.isArray(params.input)) {
+			throw new Error("expected Responses input array");
+		}
+		expect(params.input).toContainEqual({ type: "compaction_trigger" });
+	});
+
+	test("codex-v2 does not seed requests from legacy remote replacement history", async () => {
+		const compactionItem = { type: "compaction", encrypted_content: "sealed" };
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(codexV2CompactionMessage([compactionItem]));
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, strategy: "codex-v2" };
+		preparation.previousPreserveData = {
+			openaiRemoteCompaction: {
+				provider: "openai",
+				method: "legacy",
+				replacementHistory: [
+					{ type: "message", role: "user", content: [{ type: "input_text", text: "legacy retained" }] },
+				],
+				compactionItem: { type: "compaction_summary", summary: "legacy" },
+			},
+		};
+
+		await compact(preparation, makeOpenAiModel(), "test-key", undefined, undefined, {
+			remoteInstructions: "base instructions",
+			tools: [],
+		});
+
+		type CodexV2RequestContext = {
+			messages?: Array<{ providerPayload?: { items?: Array<Record<string, unknown>> } }>;
+		};
+		const context = completeSpy.mock.calls[0]?.[1] as CodexV2RequestContext | undefined;
+		const payloadItems = context?.messages?.[0]?.providerPayload?.items ?? [];
+		expect(JSON.stringify(payloadItems)).not.toContain("legacy retained");
+		expect(payloadItems.at(-1)).toEqual({ type: "compaction_trigger" });
 	});
 });

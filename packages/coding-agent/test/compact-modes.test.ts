@@ -9,10 +9,13 @@ describe("compact mode registry", () => {
 		expect(findCompactMode("soft")?.overrides).toEqual({ strategy: "context-full", remoteEnabled: false });
 		expect(findCompactMode("remote")?.overrides).toEqual({ strategy: "context-full", remoteEnabled: true });
 		expect(findCompactMode("snapcompact")?.overrides).toEqual({ strategy: "snapcompact" });
+		expect(findCompactMode("codex-v2")?.overrides).toEqual({ strategy: "codex-v2", remoteEnabled: true });
 	});
 
-	it("flags remote as remote-requiring and snapcompact as focus-rejecting", () => {
+	it("flags remote and codex-v2 as remote-requiring and snapcompact as focus-rejecting", () => {
 		expect(findCompactMode("remote")?.requiresRemote).toBe(true);
+		expect(findCompactMode("codex-v2")?.requiresRemote).toBe(true);
+		expect(findCompactMode("codex-v2")?.rejectsFocus).toBe(true);
 		expect(findCompactMode("snapcompact")?.rejectsFocus).toBe(true);
 		// soft is a plain local summary: neither flag.
 		expect(findCompactMode("soft")?.requiresRemote).toBeUndefined();
@@ -36,6 +39,7 @@ describe("parseCompactArgs", () => {
 	it("detects a leading mode token", () => {
 		expect(parseCompactArgs("soft")).toEqual({ mode: "soft" });
 		expect(parseCompactArgs("remote")).toEqual({ mode: "remote" });
+		expect(parseCompactArgs("codex-v2")).toEqual({ mode: "codex-v2" });
 		expect(parseCompactArgs("snapcompact")).toEqual({ mode: "snapcompact" });
 	});
 
@@ -57,10 +61,14 @@ describe("parseCompactArgs", () => {
 	});
 
 	it("rejects focus instructions for modes that produce no summary", () => {
-		const result = parseCompactArgs("snapcompact keep the diffs");
-		expect(result).toHaveProperty("error");
-		expect("error" in result && result.error).toContain("snapcompact");
-		// Bare snapcompact is fine.
+		const snapcompactResult = parseCompactArgs("snapcompact keep the diffs");
+		expect(snapcompactResult).toHaveProperty("error");
+		expect("error" in snapcompactResult && snapcompactResult.error).toContain("snapcompact");
+		const codexV2Result = parseCompactArgs("codex-v2 preserve encrypted state");
+		expect(codexV2Result).toHaveProperty("error");
+		expect("error" in codexV2Result && codexV2Result.error).toContain("codex-v2");
+		// Bare no-summary modes are fine.
 		expect(parseCompactArgs("snapcompact")).toEqual({ mode: "snapcompact" });
+		expect(parseCompactArgs("codex-v2")).toEqual({ mode: "codex-v2" });
 	});
 });

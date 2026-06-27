@@ -28,6 +28,8 @@ import {
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, logger } from "@oh-my-pi/pi-utils";
+import { countTokens } from "../tokenizer";
+import { shouldRetainMessageForCodexV2 } from "./messages";
 
 // ============================================================================
 // Public types
@@ -47,6 +49,10 @@ export const REMOTE_COMPACTION_TIMEOUT_MS = 180_000;
 
 const DEFAULT_AZURE_API_VERSION = "v1";
 
+const CODEX_V2_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE =
+	"Output exceeded the available model context and was truncated";
+const CODEX_V2_RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
+
 /** Race the caller's signal against the request timeout; `timeoutMs <= 0` disables the watchdog. */
 function withRequestTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
 	if (timeoutMs <= 0) return signal;
@@ -62,6 +68,7 @@ export type OpenAiRemoteCompactionItem = {
 
 export interface OpenAiRemoteCompactionPreserveData {
 	provider?: string;
+	method?: "legacy" | "codex-v2";
 	replacementHistory: Array<Record<string, unknown>>;
 	compactionItem: OpenAiRemoteCompactionItem;
 }
@@ -97,6 +104,18 @@ export function shouldUseOpenAiRemoteCompaction(model: Model): boolean {
 	if (model.provider === "openai" || model.provider === "openai-codex") return true;
 	if (model.remoteCompaction?.enabled !== true) return false;
 	return isOpenAiRemoteCompactionApi(model.remoteCompaction.api ?? model.api);
+}
+
+export function shouldUseCodexV2RemoteCompaction(model: Model): boolean {
+	if (model.remoteCompaction?.enabled === false) return false;
+	const compactionApi = model.remoteCompaction?.api ?? model.api;
+	if (model.provider === "openai" || model.provider === "openai-codex") {
+		return compactionApi === "openai-responses" || compactionApi === "openai-codex-responses";
+	}
+	return (
+		model.remoteCompaction?.enabled === true &&
+		(compactionApi === "openai-responses" || compactionApi === "openai-codex-responses")
+	);
 }
 
 function resolveOpenAiCompactEndpoint(model: Model): string {
@@ -173,7 +192,12 @@ export function getPreservedOpenAiRemoteCompactionData(
 ): OpenAiRemoteCompactionPreserveData | undefined {
 	const candidate = preserveData?.[OPENAI_REMOTE_COMPACTION_PRESERVE_KEY];
 	if (!candidate || typeof candidate !== "object") return undefined;
-	const maybeData = candidate as { provider?: unknown; replacementHistory?: unknown; compactionItem?: unknown };
+	const maybeData = candidate as {
+		provider?: unknown;
+		method?: unknown;
+		replacementHistory?: unknown;
+		compactionItem?: unknown;
+	};
 	if (!Array.isArray(maybeData.replacementHistory)) return undefined;
 	const maybeItem = maybeData.compactionItem;
 	if (!maybeItem || typeof maybeItem !== "object") return undefined;
@@ -186,6 +210,7 @@ export function getPreservedOpenAiRemoteCompactionData(
 	}
 	return {
 		provider: typeof maybeData.provider === "string" ? maybeData.provider : undefined,
+		method: maybeData.method === "codex-v2" || maybeData.method === "legacy" ? maybeData.method : undefined,
 		replacementHistory: maybeData.replacementHistory as Array<Record<string, unknown>>,
 		compactionItem: compactionItem as unknown as OpenAiRemoteCompactionItem,
 	};
@@ -265,6 +290,166 @@ function trimOpenAiCompactInput(
 	return trimmed;
 }
 
+function codexV2RewrittenOutputItem(item: Record<string, unknown>): Record<string, unknown> | undefined {
+	if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+		return {
+			...item,
+			output: CODEX_V2_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
+		};
+	}
+	if (item.type === "tool_search_output") {
+		return {
+			...item,
+			tools: [],
+		};
+	}
+	return undefined;
+}
+
+export function trimCodexV2CompactionInputToFitContextWindow(
+	input: Array<Record<string, unknown>>,
+	contextWindow: number,
+	instructions: string,
+): Array<Record<string, unknown>> {
+	const trimmed = [...input];
+	const sizes = trimmed.map(item => JSON.stringify(item).length);
+	let chars = instructions.length;
+	for (const size of sizes) chars += size;
+	const rewriteAt = (index: number, item: Record<string, unknown>): void => {
+		const previousSize = sizes[index] ?? 0;
+		const nextSize = JSON.stringify(item).length;
+		trimmed[index] = item;
+		sizes[index] = nextSize;
+		chars += nextSize - previousSize;
+	};
+	for (let index = trimmed.length - 1; index >= 0 && Math.ceil(chars / 4) > contextWindow; index--) {
+		const item = trimmed[index];
+		if (!item) break;
+		const rewritten = codexV2RewrittenOutputItem(item);
+		if (!rewritten) break;
+		rewriteAt(index, rewritten);
+	}
+	return trimmed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+export function isCodexV2CompactionItem(item: unknown): item is OpenAiRemoteCompactionItem {
+	if (!isRecord(item)) return false;
+	return item.type === "compaction" && typeof item.encrypted_content === "string";
+}
+
+function shouldRetainCodexV2InputItem(item: Record<string, unknown>): boolean {
+	if (item.type !== "message") return false;
+	return item.role === "user";
+}
+
+function textFragmentsFromResponseItem(item: Record<string, unknown>): string[] {
+	const content = item.content;
+	if (typeof content === "string") return content.length > 0 ? [content] : [];
+	if (!Array.isArray(content)) return [];
+	const fragments: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block)) continue;
+		if (typeof block.text === "string" && block.text.length > 0) {
+			fragments.push(block.text);
+		}
+	}
+	return fragments;
+}
+
+function responseMessageTokenCount(item: Record<string, unknown>): number {
+	const fragments = textFragmentsFromResponseItem(item);
+	return fragments.length === 0 ? 1 : countTokens(fragments);
+}
+
+function truncateTextToTokenBudget(text: string, maxTokens: number): string {
+	if (maxTokens <= 0) return "";
+	const textTokens = countTokens(text);
+	if (textTokens <= maxTokens) return text;
+	const marker = `…${Math.max(1, textTokens - maxTokens)} tokens truncated…`;
+	const markerTokens = countTokens(marker);
+	const contentTokens = Math.max(1, maxTokens - markerTokens);
+	const maxChars = Math.max(1, contentTokens * 4);
+	const headChars = Math.ceil(maxChars / 2);
+	const tailChars = Math.floor(maxChars / 2);
+	return `${text.slice(0, headChars)}${marker}${text.slice(Math.max(0, text.length - tailChars))}`;
+}
+function truncateResponseMessageToTokenBudget(
+	item: Record<string, unknown>,
+	maxTokens: number,
+): Record<string, unknown> | undefined {
+	if (maxTokens <= 0) return undefined;
+	const content = item.content;
+	const clone = structuredClone(item) as Record<string, unknown>;
+	if (typeof content === "string") {
+		const text = truncateTextToTokenBudget(content, maxTokens);
+		if (text.length === 0) return undefined;
+		clone.content = text;
+		return clone;
+	}
+	if (!Array.isArray(content)) return clone;
+
+	let remaining = maxTokens;
+	const nextContent: unknown[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || typeof block.text !== "string") {
+			nextContent.push(block);
+			continue;
+		}
+		if (remaining <= 0) continue;
+		const tokenCount = countTokens(block.text);
+		if (tokenCount <= remaining) {
+			nextContent.push(block);
+			remaining -= tokenCount;
+			continue;
+		}
+		const text = truncateTextToTokenBudget(block.text, remaining);
+		if (text.length > 0) {
+			nextContent.push({ ...block, text });
+			remaining = 0;
+		}
+	}
+	if (nextContent.length === 0) return undefined;
+	clone.content = nextContent;
+	return clone;
+}
+
+function truncateCodexV2RetainedMessages(items: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+	let remaining = CODEX_V2_RETAINED_MESSAGE_TOKEN_BUDGET;
+	const retainedReversed: Array<Record<string, unknown>> = [];
+	for (let i = items.length - 1; i >= 0; i--) {
+		if (remaining <= 0) continue;
+		const item = items[i];
+		if (!item) continue;
+		const tokenCount = Math.max(1, responseMessageTokenCount(item));
+		if (tokenCount <= remaining) {
+			retainedReversed.push(item);
+			remaining -= tokenCount;
+			continue;
+		}
+		const truncated = truncateResponseMessageToTokenBudget(item, remaining);
+		if (truncated) {
+			retainedReversed.push(truncated);
+			remaining = 0;
+		}
+	}
+	retainedReversed.reverse();
+	return retainedReversed;
+}
+
+export function buildCodexV2ReplacementHistory(
+	input: Array<Record<string, unknown>>,
+	compactionItem: OpenAiRemoteCompactionItem,
+): Array<Record<string, unknown>> {
+	const retained = input
+		.filter(shouldRetainCodexV2InputItem)
+		.map(item => structuredClone(item) as Record<string, unknown>);
+	return [...truncateCodexV2RetainedMessages(retained), structuredClone(compactionItem) as Record<string, unknown>];
+}
+
 // Register every tool-call id in `items` (and the subset using the custom-tool
 // wire shape) into the running sets. The history builder maintains both sets
 // incrementally as native history is appended, so this only scans the
@@ -304,12 +489,24 @@ function addOpenAiCallIds(
  * @param previousReplacementHistory - History from a prior compaction whose
  *   encrypted reasoning we want to preserve.
  */
-export function buildOpenAiNativeHistory(
+export interface OpenAiNativeHistoryWithCodexV2Retention {
+	history: Array<Record<string, unknown>>;
+	codexV2RetainedItems: Array<Record<string, unknown>>;
+}
+
+function codexV2RetainedNativeItems(items: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+	return items.filter(shouldRetainCodexV2InputItem);
+}
+
+export function buildOpenAiNativeHistoryWithCodexV2Retention(
 	messages: Message[],
 	model: Model,
 	previousReplacementHistory?: Array<Record<string, unknown>>,
-): Array<Record<string, unknown>> {
+): OpenAiNativeHistoryWithCodexV2Retention {
 	const input: Array<Record<string, unknown>> = previousReplacementHistory ? [...previousReplacementHistory] : [];
+	const codexV2RetainedItems = previousReplacementHistory
+		? codexV2RetainedNativeItems(previousReplacementHistory)
+		: [];
 	const transformedMessages = transformMessages(messages, model, id => normalizeOpenAiCompactionToolCallId(id));
 
 	let msgIndex = 0;
@@ -318,10 +515,10 @@ export function buildOpenAiNativeHistory(
 	addOpenAiCallIds(input, knownCallIds, customCallIds);
 	for (const message of transformedMessages) {
 		if (message.role === "user" || message.role === "developer") {
-			const providerPayload = (message as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
-			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
+			const historyItems = getOpenAIResponsesHistoryItems(message.providerPayload, model.provider);
 			if (historyItems) {
 				input.push(...historyItems);
+				codexV2RetainedItems.push(...codexV2RetainedNativeItems(historyItems));
 				addOpenAiCallIds(historyItems, knownCallIds, customCallIds);
 				msgIndex++;
 				continue;
@@ -349,7 +546,11 @@ export function buildOpenAiNativeHistory(
 				}
 			}
 			if (contentBlocks.length > 0) {
-				input.push({ type: "message", role: message.role, content: contentBlocks });
+				const item = { type: "message", role: message.role, content: contentBlocks };
+				input.push(item);
+				if (message.role === "user" && shouldRetainMessageForCodexV2(message)) {
+					codexV2RetainedItems.push(item);
+				}
 			}
 			msgIndex++;
 			continue;
@@ -363,11 +564,14 @@ export function buildOpenAiNativeHistory(
 				assistant.provider,
 			);
 			if (providerPayload) {
+				const retainedItems = codexV2RetainedNativeItems(providerPayload.items);
 				if (providerPayload.dt) {
 					input.push(...providerPayload.items);
+					codexV2RetainedItems.push(...retainedItems);
 					addOpenAiCallIds(providerPayload.items, knownCallIds, customCallIds);
 				} else {
 					input.splice(0, input.length, ...providerPayload.items);
+					codexV2RetainedItems.splice(0, codexV2RetainedItems.length, ...retainedItems);
 					knownCallIds.clear();
 					customCallIds.clear();
 					addOpenAiCallIds(input, knownCallIds, customCallIds);
@@ -488,7 +692,15 @@ export function buildOpenAiNativeHistory(
 		msgIndex++;
 	}
 
-	return input;
+	return { history: input, codexV2RetainedItems };
+}
+
+export function buildOpenAiNativeHistory(
+	messages: Message[],
+	model: Model,
+	previousReplacementHistory?: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+	return buildOpenAiNativeHistoryWithCodexV2Retention(messages, model, previousReplacementHistory).history;
 }
 
 // ============================================================================

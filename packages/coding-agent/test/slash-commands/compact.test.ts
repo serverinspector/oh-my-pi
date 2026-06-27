@@ -39,7 +39,7 @@ describe("/compact dispatch (ACP)", () => {
 	});
 
 	it("threads each mode subcommand into compact()", async () => {
-		for (const mode of ["soft", "remote", "snapcompact"] as const satisfies readonly CompactMode[]) {
+		for (const mode of ["soft", "remote", "codex-v2", "snapcompact"] as const satisfies readonly CompactMode[]) {
 			const h = acpRuntime();
 			await executeAcpBuiltinSlashCommand(`/compact ${mode}`, h.runtime);
 			expect(h.compact).toHaveBeenCalledWith(undefined, { mode });
@@ -58,18 +58,20 @@ describe("/compact dispatch (ACP)", () => {
 		expect(h.compact).toHaveBeenCalledWith("summarize the auth flow", undefined);
 	});
 
-	it("rejects focus text on snapcompact without compacting", async () => {
-		const h = acpRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/compact snapcompact keep the diffs", h.runtime);
-		expect(h.compact).not.toHaveBeenCalled();
-		expect(result).toEqual({ consumed: true });
-		expect((h.output.mock.calls[0]?.[0] as string) ?? "").toContain("snapcompact");
+	it("rejects focus text on no-summary modes without compacting", async () => {
+		for (const mode of ["codex-v2", "snapcompact"] as const satisfies readonly CompactMode[]) {
+			const h = acpRuntime();
+			const result = await executeAcpBuiltinSlashCommand(`/compact ${mode} keep the diffs`, h.runtime);
+			expect(h.compact).not.toHaveBeenCalled();
+			expect(result).toEqual({ consumed: true });
+			expect((h.output.mock.calls[0]?.[0] as string) ?? "").toContain(mode);
+		}
 	});
 
 	it("advertises the mode subcommands and input hint to ACP clients", () => {
 		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(c => c.name === "compact");
 		expect(advertised).toBeDefined();
-		expect(advertised?.input?.hint).toBe("[soft|remote|snapcompact] [focus]");
+		expect(advertised?.input?.hint).toBe("[soft|remote|codex-v2|snapcompact] [focus]");
 	});
 });
 
@@ -88,10 +90,18 @@ describe("/compact dispatch (TUI)", () => {
 		expect(h.handleCompactCommand).toHaveBeenCalledWith(undefined, undefined);
 	});
 
-	it("warns on snapcompact + focus text and does not compact", async () => {
+	it("routes codex-v2 mode to the TUI compaction handler", async () => {
 		const h = tuiRuntime();
-		await executeBuiltinSlashCommand("/compact snapcompact keep diffs", h.runtime);
-		expect(h.handleCompactCommand).not.toHaveBeenCalled();
-		expect(h.showWarning).toHaveBeenCalled();
+		await executeBuiltinSlashCommand("/compact codex-v2", h.runtime);
+		expect(h.handleCompactCommand).toHaveBeenCalledWith(undefined, "codex-v2");
+	});
+
+	it("warns on no-summary mode + focus text and does not compact", async () => {
+		for (const mode of ["codex-v2", "snapcompact"] as const satisfies readonly CompactMode[]) {
+			const h = tuiRuntime();
+			await executeBuiltinSlashCommand(`/compact ${mode} keep diffs`, h.runtime);
+			expect(h.handleCompactCommand).not.toHaveBeenCalled();
+			expect(h.showWarning).toHaveBeenCalled();
+		}
 	});
 });

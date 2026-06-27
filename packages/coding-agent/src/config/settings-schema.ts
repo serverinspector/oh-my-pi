@@ -1787,14 +1787,14 @@ export const SETTINGS_SCHEMA = {
 
 	"compaction.strategy": {
 		type: "enum",
-		values: ["context-full", "handoff", "shake", "snapcompact", "off"] as const,
+		values: ["context-full", "handoff", "shake", "snapcompact", "codex-v2", "off"] as const,
 		default: "snapcompact",
 		ui: {
 			tab: "context",
 			group: "Compaction",
 			label: "Compaction Strategy",
 			description:
-				"Choose in-place context-full maintenance, auto-handoff, surgical shake (drop heavy content), snapcompact (archive history as dense images), or disable auto maintenance (off)",
+				"Choose in-place context-full maintenance, auto-handoff, surgical shake (drop heavy content), snapcompact (archive history as dense images), Codex V2 remote compaction, or disable auto maintenance (off)",
 			options: [
 				{
 					value: "context-full",
@@ -1811,6 +1811,12 @@ export const SETTINGS_SCHEMA = {
 					value: "snapcompact",
 					label: "Snapcompact",
 					description: "Archive history onto dense bitmap images the model reads back; no LLM call",
+				},
+				{
+					value: "codex-v2",
+					label: "Codex V2",
+					description:
+						"Use the OpenAI Responses compaction trigger and replay provider-native replacement history",
 				},
 				{
 					value: "off",
@@ -4840,7 +4846,7 @@ export type Personality = SettingValue<"personality">;
 
 export interface CompactionSettings {
 	enabled: boolean;
-	strategy: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
+	strategy: "context-full" | "handoff" | "shake" | "snapcompact" | "codex-v2" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
 	reserveTokens: number;
