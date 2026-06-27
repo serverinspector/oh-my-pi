@@ -376,6 +376,7 @@ function truncateTextToTokenBudget(text: string, maxTokens: number): string {
 	if (textTokens <= maxTokens) return text;
 	const marker = `…${Math.max(1, textTokens - maxTokens)} tokens truncated…`;
 	const markerTokens = countTokens(marker);
+	if (markerTokens >= maxTokens) return "";
 	const contentTokens = Math.max(1, maxTokens - markerTokens);
 	const maxChars = Math.max(1, contentTokens * 4);
 	const headChars = Math.ceil(maxChars / 2);

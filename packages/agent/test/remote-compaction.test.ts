@@ -333,6 +333,35 @@ describe("Codex V2 replacement history", () => {
 		expect(history.at(-1)).toEqual(compactionItem);
 	});
 
+	test("drops an oversized text message when the remaining budget cannot fit the truncation marker", () => {
+		const compactionItem = { type: "compaction" as const, encrypted_content: "sealed" };
+		const newestNearlyFullBudget = "n".repeat(255_996);
+		const history = buildCodexV2ReplacementHistory(
+			[
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: `old ${"x".repeat(1_000)}` }],
+				},
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: newestNearlyFullBudget }],
+				},
+			],
+			compactionItem,
+		);
+
+		expect(history).toEqual([
+			{
+				type: "message",
+				role: "user",
+				content: [{ type: "input_text", text: newestNearlyFullBudget }],
+			},
+			compactionItem,
+		]);
+	});
+
 	test("drops oversized retained image messages from the retained-message budget", () => {
 		const compactionItem = { type: "compaction" as const, encrypted_content: "sealed" };
 		const history = buildCodexV2ReplacementHistory(
