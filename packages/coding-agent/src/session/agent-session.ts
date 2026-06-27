@@ -324,6 +324,10 @@ import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey }
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
 import { YieldQueue } from "./yield-queue";
 
+export function resolveAdvisorCompactionSettings(settings: CompactionSettings): CompactionSettings {
+	return settings.strategy === "codex-v2" ? { ...settings, strategy: "context-full" } : settings;
+}
+
 const SESSION_STOP_CONTINUATION_CAP = 8;
 
 /** Abort reason for the Gemini reasoning-header runaway interrupt. Surfaced on the
@@ -2223,6 +2227,7 @@ export class AgentSession {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.strategy === "off") return false;
 		if (!compactionSettings.enabled) return false;
+		const advisorCompactionSettings = resolveAdvisorCompactionSettings(compactionSettings);
 
 		const advisorModel = advisor.state.model;
 		const contextWindow = advisorModel.contextWindow ?? 0;
@@ -2234,7 +2239,7 @@ export class AgentSession {
 			contextTokens += estimateTokens(message);
 		}
 
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) {
+		if (!shouldCompact(contextTokens, contextWindow, advisorCompactionSettings)) {
 			return false;
 		}
 
@@ -2244,7 +2249,7 @@ export class AgentSession {
 			const newModel = advisor.state.model;
 			const newWindow = newModel.contextWindow ?? 0;
 			if (newWindow > 0) {
-				const stillNeedsCompaction = shouldCompact(contextTokens, newWindow, compactionSettings);
+				const stillNeedsCompaction = shouldCompact(contextTokens, newWindow, advisorCompactionSettings);
 				if (!stillNeedsCompaction) return false;
 			}
 		}
@@ -2277,7 +2282,7 @@ export class AgentSession {
 			} satisfies SessionMessageEntry;
 		});
 
-		const preparation = prepareCompaction(pathEntries, compactionSettings);
+		const preparation = prepareCompaction(pathEntries, advisorCompactionSettings);
 		if (!preparation) {
 			// Cannot prepare compaction, fallback to re-prime
 			return true;
@@ -2287,10 +2292,10 @@ export class AgentSession {
 			? ThinkingLevel.Off
 			: advisor.state.thinkingLevel;
 
-		// Advisor state is in-memory-only, so snapcompact's frame archive has no
-		// stable SessionEntry preserveData slot to carry across future advisor
-		// maintenance runs. Use an LLM summary even when the primary session is
-		// configured for snapcompact.
+		// Advisor state is in-memory-only, so it has no stable preserveData slot
+		// for snapcompact frames or Codex V2 replacement history. Use the
+		// context-full LLM summary path for advisor maintenance even when the
+		// primary session is configured for snapcompact or Codex V2.
 		const availableModels = this.#modelRegistry.getAvailable();
 		const candidates = this.#resolveCompactionModelCandidates(advisorModel, availableModels);
 		if (candidates.length === 0) {
