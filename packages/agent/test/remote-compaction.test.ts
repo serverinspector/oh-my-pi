@@ -610,6 +610,9 @@ describe("compact() remote compaction failure handling", () => {
 			remoteInstructions: "base instructions",
 			serviceTier: "priority",
 			tools: [tool],
+			sessionId: "session-1:compact:side",
+			promptCacheKey: "session-1",
+			preferWebsockets: false,
 		});
 
 		expect(result.summary).toContain("Codex V2 remote compaction");
@@ -627,12 +630,18 @@ describe("compact() remote compaction failure handling", () => {
 		const options = completeSpy.mock.calls[0]?.[2] as
 			| {
 					maxTokens?: number;
+					preferWebsockets?: boolean;
+					promptCacheKey?: string;
 					serviceTier?: string;
+					sessionId?: string;
 					streamFirstEventTimeoutMs?: number;
 					streamIdleTimeoutMs?: number;
 			  }
 			| undefined;
 		expect(options?.serviceTier).toBe("priority");
+		expect(options?.sessionId).toBe("session-1:compact:side");
+		expect(options?.promptCacheKey).toBe("session-1");
+		expect(options?.preferWebsockets).toBe(false);
 		expect(options?.streamIdleTimeoutMs).toBe(300_000);
 		expect(options?.streamFirstEventTimeoutMs).toBe(300_000);
 		expect(options).not.toHaveProperty("maxTokens");

@@ -656,6 +656,9 @@ export interface SummaryOptions {
 	convertToLlm?: ConvertToLlm;
 	tools?: Tool[];
 	serviceTier?: ServiceTier;
+	sessionId?: SimpleStreamOptions["sessionId"];
+	promptCacheKey?: SimpleStreamOptions["promptCacheKey"];
+	preferWebsockets?: SimpleStreamOptions["preferWebsockets"];
 	/**
 	 * Optional telemetry handle. When provided, every LLM call emitted during
 	 * compaction is wrapped in an OTEL chat span tagged with
@@ -719,6 +722,9 @@ async function requestCodexV2RemoteCompactionViaProvider(
 			reasoning: resolveCompactionEffort(model, options.thinkingLevel),
 			initiatorOverride: options.initiatorOverride,
 			serviceTier: options.serviceTier,
+			sessionId: options.sessionId,
+			promptCacheKey: options.promptCacheKey,
+			preferWebsockets: options.preferWebsockets,
 			streamIdleTimeoutMs: CODEX_V2_COMPACTION_STREAM_IDLE_TIMEOUT_MS,
 			streamFirstEventTimeoutMs: CODEX_V2_COMPACTION_STREAM_IDLE_TIMEOUT_MS,
 			metadata: options.metadata,
@@ -1209,6 +1215,9 @@ export async function compact(
 		convertToLlm: options?.convertToLlm,
 		tools: options?.tools,
 		serviceTier: options?.serviceTier,
+		sessionId: options?.sessionId,
+		promptCacheKey: options?.promptCacheKey,
+		preferWebsockets: options?.preferWebsockets,
 		telemetry: options?.telemetry,
 		// Honor /model thinking selection on every fan-out summarizer.
 		// Without this propagation, generateSummary / generateTurnPrefixSummary

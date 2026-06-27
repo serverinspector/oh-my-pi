@@ -5,6 +5,7 @@ import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import {
 	resolveAdvisorCompactionSettings,
 	resolveCodexV2ActiveCompactionCandidates,
+	resolveCodexV2CompactionCacheOptions,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 
 function settings(strategy: CompactionSettings["strategy"]): CompactionSettings {
@@ -51,6 +52,24 @@ describe("resolveCodexV2ActiveCompactionCandidates", () => {
 
 	it("rejects non-OpenAI active models instead of relying on fallback candidates", () => {
 		expect(resolveCodexV2ActiveCompactionCandidates(anthropicModel())).toEqual([]);
+	});
+});
+
+describe("resolveCodexV2CompactionCacheOptions", () => {
+	it("uses the live prompt cache key while isolating the side request session id", () => {
+		expect(resolveCodexV2CompactionCacheOptions("provider-session", "live-cache-key", "side-1")).toEqual({
+			sessionId: "provider-session:compact:side-1",
+			promptCacheKey: "live-cache-key",
+			preferWebsockets: false,
+		});
+	});
+
+	it("falls back to the provider session id when no live prompt cache key is set", () => {
+		expect(resolveCodexV2CompactionCacheOptions("provider-session", undefined, "side-1")).toEqual({
+			sessionId: "provider-session:compact:side-1",
+			promptCacheKey: "provider-session",
+			preferWebsockets: false,
+		});
 	});
 });
 

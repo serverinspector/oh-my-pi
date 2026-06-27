@@ -332,6 +332,18 @@ export function resolveCodexV2ActiveCompactionCandidates(model: Model | null | u
 	return model && shouldUseCodexV2RemoteCompaction(model) ? [model] : [];
 }
 
+export function resolveCodexV2CompactionCacheOptions(
+	providerSessionId: string,
+	promptCacheKey: string | undefined,
+	requestId: string,
+): Pick<SummaryOptions, "sessionId" | "promptCacheKey" | "preferWebsockets"> {
+	return {
+		sessionId: `${providerSessionId}:compact:${requestId}`,
+		promptCacheKey: promptCacheKey ?? providerSessionId,
+		preferWebsockets: false,
+	};
+}
+
 const SESSION_STOP_CONTINUATION_CAP = 8;
 
 /** Abort reason for the Gemini reasoning-header runaway interrupt. Surfaced on the
@@ -4714,6 +4726,14 @@ export class AgentSession {
 
 	#activeProviderSessionId(sessionId?: string): string {
 		return this.#freshProviderSessionId ?? this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
+	}
+
+	#codexV2CompactionCacheOptions(): Pick<SummaryOptions, "sessionId" | "promptCacheKey" | "preferWebsockets"> {
+		return resolveCodexV2CompactionCacheOptions(
+			this.#activeProviderSessionId(),
+			this.agent.promptCacheKey ?? this.agent.sessionId,
+			Snowflake.next(),
+		);
 	}
 
 	/**
@@ -10313,6 +10333,7 @@ export class AgentSession {
 						// via resolveCompactionEffort so unsupported-effort models
 						// (xai-oauth/grok-build) don't trip requireSupportedEffort.
 						thinkingLevel: this.thinkingLevel,
+						...(preparation.settings.strategy === "codex-v2" ? this.#codexV2CompactionCacheOptions() : {}),
 					},
 				);
 			} catch (error) {
@@ -10913,6 +10934,9 @@ export class AgentSession {
 									convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
 									tools: this.agent.state.tools,
 									serviceTier: this.#effectiveServiceTier(candidate),
+									...(preparation.settings.strategy === "codex-v2"
+										? this.#codexV2CompactionCacheOptions()
+										: {}),
 									telemetry,
 									// Honor the user's /model thinking selection on the
 									// auto-compaction path — the most-fired compaction
