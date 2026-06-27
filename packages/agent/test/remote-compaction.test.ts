@@ -257,13 +257,14 @@ describe("remote compaction input trimming", () => {
 		expect(requestInput?.some(item => item.type === "custom_tool_call_output")).toBe(false);
 	});
 
-	test("rewrites trailing tool outputs for Codex V2 compaction input overflow", () => {
+	test("continues scanning older tool outputs when newer items cannot be rewritten", () => {
 		const trimmed = trimCodexV2CompactionInputToFitContextWindow(
 			[
 				{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" },
 				{ type: "function_call_output", call_id: "call_1", output: "x".repeat(10_000) },
+				{ type: "message", role: "assistant", content: [{ type: "output_text", text: "tail" }] },
 			],
-			1,
+			200,
 			"compact",
 		);
 
@@ -274,7 +275,18 @@ describe("remote compaction input trimming", () => {
 				call_id: "call_1",
 				output: "Output exceeded the available model context and was truncated",
 			},
+			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "tail" }] },
 		]);
+	});
+
+	test("fails locally when Codex V2 input still exceeds context after trimming", () => {
+		expect(() =>
+			trimCodexV2CompactionInputToFitContextWindow(
+				[{ type: "message", role: "user", content: [{ type: "input_text", text: "x".repeat(10_000) }] }],
+				1,
+				"compact",
+			),
+		).toThrow("exceeds the model context window");
 	});
 });
 
@@ -319,6 +331,28 @@ describe("Codex V2 replacement history", () => {
 		expect(block.text).toContain("tokens truncated");
 		expect(block.text.endsWith("END")).toBe(true);
 		expect(history.at(-1)).toEqual(compactionItem);
+	});
+
+	test("drops oversized retained image messages from the retained-message budget", () => {
+		const compactionItem = { type: "compaction" as const, encrypted_content: "sealed" };
+		const history = buildCodexV2ReplacementHistory(
+			[
+				{
+					type: "message",
+					role: "user",
+					content: [
+						{
+							type: "input_image",
+							image_url: `data:image/png;base64,${"x".repeat(300_000)}`,
+							detail: "auto",
+						},
+					],
+				},
+			],
+			compactionItem,
+		);
+
+		expect(history).toEqual([compactionItem]);
 	});
 
 	test("carries explicit Codex V2 retention decisions through native history conversion", () => {

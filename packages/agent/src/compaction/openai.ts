@@ -326,8 +326,11 @@ export function trimCodexV2CompactionInputToFitContextWindow(
 		const item = trimmed[index];
 		if (!item) break;
 		const rewritten = codexV2RewrittenOutputItem(item);
-		if (!rewritten) break;
+		if (!rewritten) continue;
 		rewriteAt(index, rewritten);
+	}
+	if (Math.ceil(chars / 4) > contextWindow) {
+		throw new Error("Codex V2 compaction input exceeds the model context window after trimming");
 	}
 	return trimmed;
 }
@@ -346,23 +349,25 @@ function shouldRetainCodexV2InputItem(item: Record<string, unknown>): boolean {
 	return item.role === "user";
 }
 
-function textFragmentsFromResponseItem(item: Record<string, unknown>): string[] {
-	const content = item.content;
-	if (typeof content === "string") return content.length > 0 ? [content] : [];
-	if (!Array.isArray(content)) return [];
-	const fragments: string[] = [];
-	for (const block of content) {
-		if (!isRecord(block)) continue;
-		if (typeof block.text === "string" && block.text.length > 0) {
-			fragments.push(block.text);
-		}
+function serializedTokenEstimate(value: unknown): number {
+	const serialized = JSON.stringify(value);
+	return Math.max(1, Math.ceil((serialized?.length ?? 0) / 4));
+}
+
+function responseContentBlockTokenCount(block: unknown): number {
+	if (isRecord(block) && typeof block.text === "string") {
+		return Math.max(1, countTokens(block.text));
 	}
-	return fragments;
+	return serializedTokenEstimate(block);
 }
 
 function responseMessageTokenCount(item: Record<string, unknown>): number {
-	const fragments = textFragmentsFromResponseItem(item);
-	return fragments.length === 0 ? 1 : countTokens(fragments);
+	const content = item.content;
+	if (typeof content === "string") return Math.max(1, countTokens(content));
+	if (!Array.isArray(content)) return serializedTokenEstimate(item);
+	let total = 0;
+	for (const block of content) total += responseContentBlockTokenCount(block);
+	return Math.max(1, total);
 }
 
 function truncateTextToTokenBudget(text: string, maxTokens: number): string {
@@ -396,7 +401,11 @@ function truncateResponseMessageToTokenBudget(
 	const nextContent: unknown[] = [];
 	for (const block of content) {
 		if (!isRecord(block) || typeof block.text !== "string") {
-			nextContent.push(block);
+			const tokenCount = responseContentBlockTokenCount(block);
+			if (tokenCount <= remaining) {
+				nextContent.push(block);
+				remaining -= tokenCount;
+			}
 			continue;
 		}
 		if (remaining <= 0) continue;
