@@ -328,6 +328,10 @@ export function resolveAdvisorCompactionSettings(settings: CompactionSettings): 
 	return settings.strategy === "codex-v2" ? { ...settings, strategy: "context-full" } : settings;
 }
 
+export function resolveCodexV2ActiveCompactionCandidates(model: Model | null | undefined): Model[] {
+	return model && shouldUseCodexV2RemoteCompaction(model) ? [model] : [];
+}
+
 const SESSION_STOP_CONTINUATION_CAP = 8;
 
 /** Abort reason for the Gemini reasoning-header runaway interrupt. Surfaced on the
@@ -8418,15 +8422,13 @@ export class AgentSession {
 			const availableModels = this.#modelRegistry.getAvailable();
 			const requireCodexV2 = effectiveSettings.strategy === "codex-v2";
 			const requireProviderRemote = Boolean(compactMode?.requiresRemote && !effectiveSettings.remoteEndpoint);
-			const remotePredicate = requireCodexV2
-				? shouldUseCodexV2RemoteCompaction
-				: requireProviderRemote
-					? shouldUseOpenAiRemoteCompaction
-					: undefined;
-			let compactionCandidates = this.#getCompactionModelCandidates(availableModels, remotePredicate);
+			const remotePredicate = requireProviderRemote ? shouldUseOpenAiRemoteCompaction : undefined;
+			let compactionCandidates = requireCodexV2
+				? resolveCodexV2ActiveCompactionCandidates(this.model)
+				: this.#getCompactionModelCandidates(availableModels, remotePredicate);
 			if (requireCodexV2 && compactionCandidates.length === 0) {
 				throw new Error(
-					`Codex V2 compaction requires an OpenAI Responses-capable model (${this.model.id} is not eligible and no eligible fallback is configured).`,
+					`Codex V2 compaction requires the active model to be OpenAI Responses-capable (${this.model.id} is not eligible).`,
 				);
 			}
 			if (requireProviderRemote && !requireCodexV2 && compactionCandidates.length === 0) {
@@ -10873,13 +10875,13 @@ export class AgentSession {
 				details = snapcompactResult.details;
 				preserveData = { ...(compactionPrep.preserveData ?? {}), ...(snapcompactResult.preserveData ?? {}) };
 			} else {
-				const candidates = this.#getCompactionModelCandidates(
-					availableModels,
-					compactionSettings.strategy === "codex-v2" ? shouldUseCodexV2RemoteCompaction : undefined,
-				);
-				if (compactionSettings.strategy === "codex-v2" && candidates.length === 0) {
+				const requiresCodexV2 = compactionSettings.strategy === "codex-v2";
+				const candidates = requiresCodexV2
+					? resolveCodexV2ActiveCompactionCandidates(this.model)
+					: this.#getCompactionModelCandidates(availableModels);
+				if (requiresCodexV2 && candidates.length === 0) {
 					throw new Error(
-						`Codex V2 compaction requires an OpenAI Responses-capable model (${this.model.id} is not eligible and no eligible fallback is configured).`,
+						`Codex V2 compaction requires the active model to be OpenAI Responses-capable (${this.model.id} is not eligible).`,
 					);
 				}
 				const retrySettings = this.settings.getGroup("retry");
